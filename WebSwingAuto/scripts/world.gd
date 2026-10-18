@@ -8,6 +8,7 @@ var web_material: StandardMaterial3D
 var web_active := false
 var web_anchor := Vector3.ZERO
 var rope_length := 0.0
+var mouse_yank_input := Vector2.ZERO
 var camera_yaw := 0.0
 var camera_pitch := -0.20
 var orbit_dragging := false
@@ -20,8 +21,19 @@ const AIR_ACCELERATION := 14.0
 const JUMP_FORCE := 17.0
 const GRAVITY := 32.0
 const WEB_RANGE := 300.0
-const WEB_PULL_FORCE := 48.0
-const SWING_STEERING_FORCE := 24.0
+const SPRING_STRENGTH := 20.0
+const SPRING_DAMPING := 5.0
+const MAX_SPRING_FORCE := 115.0
+const ROPE_SAFETY_STRETCH := 1.5
+const SWING_FORWARD_FORCE := 30.0
+const SWING_SIDE_FORCE := 42.0
+const SWING_REVERSE_FORCE := 24.0
+const REEL_PULL_FORCE := 16.0
+const MAX_SWING_SPEED := 82.0
+const MOUSE_YANK_HORIZONTAL_STRENGTH := 0.035
+const MOUSE_YANK_FORWARD_STRENGTH := 0.045
+const MAX_MOUSE_YANK_PIXELS := 140.0
+const MAX_MOUSE_YANK_IMPULSE := 8.0
 const ROPE_SHORTEN_SPEED := 20.0
 const MIN_ROPE_LENGTH := 7.0
 const CAMERA_HEIGHT := 5.0
@@ -48,14 +60,19 @@ func _input(event):
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			release_web()
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
-			camera_pitch = clamp(camera_pitch + deg_to_rad(4.0), deg_to_rad(-65.0), deg_to_rad(65.0))
+			camera_pitch = clampf(camera_pitch + deg_to_rad(4.0), deg_to_rad(-65.0), deg_to_rad(65.0))
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
-			camera_pitch = clamp(camera_pitch - deg_to_rad(4.0), deg_to_rad(-65.0), deg_to_rad(65.0))
+			camera_pitch = clampf(camera_pitch - deg_to_rad(4.0), deg_to_rad(-65.0), deg_to_rad(65.0))
 
-	if event is InputEventMouseMotion and orbit_dragging:
-		camera_yaw -= event.relative.x * MOUSE_SENSITIVITY
-		camera_pitch -= event.relative.y * MOUSE_SENSITIVITY
-		camera_pitch = clamp(camera_pitch, deg_to_rad(-50.0), deg_to_rad(50.0))
+	if event is InputEventMouseMotion:
+		if orbit_dragging:
+			camera_yaw -= event.relative.x * MOUSE_SENSITIVITY
+			camera_pitch -= event.relative.y * MOUSE_SENSITIVITY
+			camera_pitch = clampf(camera_pitch, deg_to_rad(-50.0), deg_to_rad(50.0))
+		elif web_active:
+			mouse_yank_input += event.screen_relative
+			mouse_yank_input.x = clampf(mouse_yank_input.x, -MAX_MOUSE_YANK_PIXELS, MAX_MOUSE_YANK_PIXELS)
+			mouse_yank_input.y = clampf(mouse_yank_input.y, -MAX_MOUSE_YANK_PIXELS, MAX_MOUSE_YANK_PIXELS)
 
 	if event is InputEventKey and event.pressed:
 		if event.keycode == KEY_R:
@@ -76,7 +93,11 @@ func _physics_process(delta):
 	if player.global_position.y < -40.0:
 		reset_player()
 
-func handle_player_movement(delta):
+func handle_player_movement(delta: float):
+	if web_active:
+		player.velocity.y -= GRAVITY * delta
+		return
+
 	var input_vector := Vector2.ZERO
 	if Input.is_key_pressed(KEY_W):
 		input_vector.y -= 1.0
@@ -112,6 +133,7 @@ func handle_player_movement(delta):
 func attach_web(screen_position: Vector2):
 	if camera == null or player == null:
 		return
+	mouse_yank_input = Vector2.ZERO
 	var ray_start := camera.project_ray_origin(screen_position)
 	var ray_direction := camera.project_ray_normal(screen_position)
 	var ray_end := ray_start + ray_direction * WEB_RANGE
@@ -119,57 +141,103 @@ func attach_web(screen_position: Vector2):
 	query.exclude = [player.get_rid()]
 	query.collide_with_areas = false
 	query.collide_with_bodies = true
-	var result = get_world_3d().direct_space_state.intersect_ray(query)
+	var result: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
 	if result.is_empty():
 		return
-	web_anchor = result["position"]
-	rope_length = max(get_web_origin().distance_to(web_anchor), MIN_ROPE_LENGTH)
+	var hit_position: Vector3 = result["position"]
+	web_anchor = hit_position
+	rope_length = maxf(get_web_origin().distance_to(web_anchor), MIN_ROPE_LENGTH)
 	web_active = true
-	player.velocity += (web_anchor - get_web_origin()).normalized() * 10.0
 
 func release_web():
 	web_active = false
+	mouse_yank_input = Vector2.ZERO
 	if web_mesh != null:
 		web_mesh.clear_surfaces()
 
-func apply_web_physics(delta):
-	var to_anchor := web_anchor - get_web_origin()
-	var distance := to_anchor.length()
-	if distance <= 0.01:
-		return
-	var rope_direction := to_anchor / distance
-	player.velocity += rope_direction * WEB_PULL_FORCE * delta
-	var steering_input := Vector2.ZERO
-	if Input.is_key_pressed(KEY_W):
-		steering_input.y -= 1.0
-	if Input.is_key_pressed(KEY_S):
-		steering_input.y += 1.0
-	if Input.is_key_pressed(KEY_A):
-		steering_input.x -= 1.0
-	if Input.is_key_pressed(KEY_D):
-		steering_input.x += 1.0
-	if steering_input.length() > 1.0:
-		steering_input = steering_input.normalized()
-	var forward := -camera.global_transform.basis.z
-	var right := camera.global_transform.basis.x
-	forward.y = 0.0
-	right.y = 0.0
-	forward = forward.normalized()
-	right = right.normalized()
-	var steering_direction := right * steering_input.x + forward * -steering_input.y
-	if steering_direction.length() > 0.0:
-		player.velocity += steering_direction.normalized() * SWING_STEERING_FORCE * delta
+func apply_web_physics(delta: float):
+	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
+	var distance: float = anchor_to_player.length()
+	if distance > 0.01:
+		var outward_direction: Vector3 = anchor_to_player / distance
+		var stretch: float = distance - rope_length
+		if stretch > 0.0:
+			var outward_speed: float = player.velocity.dot(outward_direction)
+			var spring_force: float = clampf(
+				stretch * SPRING_STRENGTH + outward_speed * SPRING_DAMPING,
+				0.0,
+				MAX_SPRING_FORCE
+			)
+			player.velocity -= outward_direction * spring_force * delta
+
+	apply_omnidirectional_swing_control(delta)
+	apply_mouse_yank()
 	if Input.is_key_pressed(KEY_SPACE):
-		rope_length = max(MIN_ROPE_LENGTH, rope_length - ROPE_SHORTEN_SPEED * delta)
-		player.velocity.y += 12.0 * delta
+		rope_length = maxf(MIN_ROPE_LENGTH, rope_length - ROPE_SHORTEN_SPEED * delta)
+		var to_anchor: Vector3 = web_anchor - get_web_origin()
+		if to_anchor.length() > 0.01:
+			player.velocity += to_anchor.normalized() * REEL_PULL_FORCE * delta
+	if player.velocity.length() > MAX_SWING_SPEED:
+		player.velocity = player.velocity.normalized() * MAX_SWING_SPEED
+
+func apply_omnidirectional_swing_control(delta: float):
+	var forward_input: float = 0.0
+	var side_input: float = 0.0
+	if Input.is_key_pressed(KEY_W):
+		forward_input += 1.0
+	if Input.is_key_pressed(KEY_S):
+		forward_input -= 1.0
+	if Input.is_key_pressed(KEY_A):
+		side_input -= 1.0
+	if Input.is_key_pressed(KEY_D):
+		side_input += 1.0
+	var input_vector: Vector2 = Vector2(side_input, forward_input)
+	if input_vector.length() > 1.0:
+		input_vector = input_vector.normalized()
+	if input_vector == Vector2.ZERO:
+		return
+	side_input = input_vector.x
+	forward_input = input_vector.y
+
+	var forward: Vector3 = project_onto_swing_plane(-camera.global_transform.basis.z)
+	var right: Vector3 = project_onto_swing_plane(camera.global_transform.basis.x)
+	var forward_force: float = SWING_FORWARD_FORCE if forward_input >= 0.0 else SWING_REVERSE_FORCE
+	player.velocity += (
+		forward * forward_input * forward_force
+		+ right * side_input * SWING_SIDE_FORCE
+	) * delta
+
+func project_onto_swing_plane(direction: Vector3) -> Vector3:
+	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
+	if anchor_to_player.length_squared() <= 0.0001:
+		return Vector3.ZERO
+	var rope_direction: Vector3 = anchor_to_player.normalized()
+	var projected_direction: Vector3 = direction - rope_direction * direction.dot(rope_direction)
+	if projected_direction.length_squared() <= 0.0001:
+		return Vector3.ZERO
+	return projected_direction.normalized()
+
+func apply_mouse_yank():
+	if mouse_yank_input == Vector2.ZERO:
+		return
+	var forward: Vector3 = project_onto_swing_plane(-camera.global_transform.basis.z)
+	var right: Vector3 = project_onto_swing_plane(camera.global_transform.basis.x)
+	var impulse: Vector3 = (
+		right * mouse_yank_input.x * MOUSE_YANK_HORIZONTAL_STRENGTH
+		+ forward * mouse_yank_input.y * MOUSE_YANK_FORWARD_STRENGTH
+	)
+	if impulse.length() > MAX_MOUSE_YANK_IMPULSE:
+		impulse = impulse.normalized() * MAX_MOUSE_YANK_IMPULSE
+	player.velocity += impulse
+	mouse_yank_input = Vector2.ZERO
 
 func enforce_rope_constraint():
-	var anchor_to_player := get_web_origin() - web_anchor
-	var current_distance := anchor_to_player.length()
-	if current_distance <= rope_length or current_distance <= 0.01:
+	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
+	var current_distance: float = anchor_to_player.length()
+	if current_distance <= rope_length + ROPE_SAFETY_STRETCH or current_distance <= 0.01:
 		return
-	var outward_direction := anchor_to_player / current_distance
-	var outward_speed := player.velocity.dot(outward_direction)
+	var outward_direction: Vector3 = anchor_to_player / current_distance
+	var outward_speed: float = player.velocity.dot(outward_direction)
 	if outward_speed > 0.0:
 		player.velocity -= outward_direction * outward_speed
 	player.global_position -= outward_direction * (current_distance - rope_length)
