@@ -9,6 +9,7 @@ var web_active := false
 var web_anchor := Vector3.ZERO
 var rope_length := 0.0
 var mouse_yank_input := Vector2.ZERO
+var jumps_remaining := 2
 var camera_yaw := 0.0
 var camera_pitch := -0.20
 var orbit_dragging := false
@@ -18,7 +19,7 @@ const GROUND_SPEED := 24.0
 const AIR_SPEED := 28.0
 const GROUND_ACCELERATION := 60.0
 const AIR_ACCELERATION := 14.0
-const JUMP_FORCE := 17.0
+const JUMP_FORCE := 26.0
 const GRAVITY := 32.0
 const WEB_RANGE := 300.0
 const SPRING_STRENGTH := 20.0
@@ -81,6 +82,8 @@ func _input(event):
 func _physics_process(delta):
 	if player == null:
 		return
+	if player.is_on_floor():
+		jumps_remaining = 2
 	update_camera()
 	handle_player_movement(delta)
 	if web_active:
@@ -122,13 +125,14 @@ func handle_player_movement(delta: float):
 		var target_velocity := desired_direction * GROUND_SPEED
 		player.velocity.x = move_toward(player.velocity.x, target_velocity.x, GROUND_ACCELERATION * delta)
 		player.velocity.z = move_toward(player.velocity.z, target_velocity.z, GROUND_ACCELERATION * delta)
-		if Input.is_key_pressed(KEY_SPACE):
-			player.velocity.y = JUMP_FORCE
 	else:
 		var target_air_velocity := desired_direction * AIR_SPEED
 		player.velocity.x = move_toward(player.velocity.x, target_air_velocity.x, AIR_ACCELERATION * delta)
 		player.velocity.z = move_toward(player.velocity.z, target_air_velocity.z, AIR_ACCELERATION * delta)
 		player.velocity.y -= GRAVITY * delta
+	if Input.is_action_just_pressed("ui_accept") and jumps_remaining > 0:
+		player.velocity.y = JUMP_FORCE
+		jumps_remaining -= 1
 
 func attach_web(screen_position: Vector2):
 	if camera == null or player == null:
