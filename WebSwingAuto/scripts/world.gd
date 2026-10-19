@@ -8,12 +8,11 @@ var web_material: StandardMaterial3D
 var web_active := false
 var web_anchor := Vector3.ZERO
 var rope_length := 0.0
-var mouse_yank_input := Vector2.ZERO
+var camera_panning_enabled := false
 var jumps_remaining := 2
-var camera_yaw := 0.0
-var camera_pitch := -0.20
-var orbit_dragging := false
-var camera_distance := 18.0
+var camera_yaw: float = 0.0
+var camera_pitch: float = 0.0
+var camera_position_initialized := false
 
 const GROUND_SPEED := 24.0
 const AIR_SPEED := 28.0
@@ -22,6 +21,7 @@ const AIR_ACCELERATION := 14.0
 const JUMP_FORCE := 26.0
 const GRAVITY := 32.0
 const WEB_RANGE := 300.0
+const WEB_CLIMB_SPEED := 22.0
 const SPRING_STRENGTH := 20.0
 const SPRING_DAMPING := 5.0
 const MAX_SPRING_FORCE := 115.0
@@ -29,16 +29,17 @@ const ROPE_SAFETY_STRETCH := 1.5
 const SWING_FORWARD_FORCE := 30.0
 const SWING_SIDE_FORCE := 42.0
 const SWING_REVERSE_FORCE := 24.0
-const REEL_PULL_FORCE := 16.0
 const MAX_SWING_SPEED := 82.0
-const MOUSE_YANK_HORIZONTAL_STRENGTH := 0.035
-const MOUSE_YANK_FORWARD_STRENGTH := 0.045
-const MAX_MOUSE_YANK_PIXELS := 140.0
-const MAX_MOUSE_YANK_IMPULSE := 8.0
-const ROPE_SHORTEN_SPEED := 20.0
+const WEB_ATTACH_YANK_IMPULSE := 12.0
 const MIN_ROPE_LENGTH := 7.0
-const CAMERA_HEIGHT := 5.0
 const MOUSE_SENSITIVITY := 0.003
+const DEFAULT_CAMERA_DISTANCE: float = 14.0
+const DEFAULT_CAMERA_HEIGHT: float = 3.5
+const DEFAULT_CAMERA_PITCH: float = 0.0
+const CAMERA_POSITION_SMOOTHING: float = 10.0
+const CAMERA_COLLISION_MARGIN: float = 0.5
+const CAMERA_MINIMUM_HEIGHT: float = 0.75
+const CAMERA_LOOK_HEIGHT: float = 1.0
 const CITY_EXTENT := 350
 const BUILDING_SPACING := 48
 
@@ -54,26 +55,18 @@ func _ready():
 
 func _input(event):
 	if event is InputEventMouseButton:
-		if event.button_index == MOUSE_BUTTON_MIDDLE:
-			orbit_dragging = event.pressed
-		elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-			attach_web(event.position)
+		if event.button_index == MOUSE_BUTTON_LEFT:
+			if event.pressed:
+				camera_panning_enabled = true
+				attach_web(event.position)
+			else:
+				camera_panning_enabled = false
+				release_web()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			release_web()
-		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
-			camera_pitch = clampf(camera_pitch + deg_to_rad(4.0), deg_to_rad(-65.0), deg_to_rad(65.0))
-		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
-			camera_pitch = clampf(camera_pitch - deg_to_rad(4.0), deg_to_rad(-65.0), deg_to_rad(65.0))
-
 	if event is InputEventMouseMotion:
-		if orbit_dragging:
-			camera_yaw -= event.relative.x * MOUSE_SENSITIVITY
-			camera_pitch -= event.relative.y * MOUSE_SENSITIVITY
-			camera_pitch = clampf(camera_pitch, deg_to_rad(-50.0), deg_to_rad(50.0))
-		elif web_active:
-			mouse_yank_input += event.screen_relative
-			mouse_yank_input.x = clampf(mouse_yank_input.x, -MAX_MOUSE_YANK_PIXELS, MAX_MOUSE_YANK_PIXELS)
-			mouse_yank_input.y = clampf(mouse_yank_input.y, -MAX_MOUSE_YANK_PIXELS, MAX_MOUSE_YANK_PIXELS)
+		if camera_panning_enabled:
+			camera_yaw += event.relative.x * MOUSE_SENSITIVITY
 
 	if event is InputEventKey and event.pressed:
 		if event.keycode == KEY_R:
@@ -82,16 +75,15 @@ func _input(event):
 func _physics_process(delta):
 	if player == null:
 		return
-	if player.is_on_floor():
+	if not web_active and player.is_on_floor():
 		jumps_remaining = 2
-	update_camera()
 	handle_player_movement(delta)
 	if web_active:
 		apply_web_physics(delta)
 	player.move_and_slide()
 	if web_active:
 		enforce_rope_constraint()
-	update_camera()
+	update_camera(delta)
 	update_web_line()
 	if player.global_position.y < -40.0:
 		reset_player()
@@ -137,7 +129,6 @@ func handle_player_movement(delta: float):
 func attach_web(screen_position: Vector2):
 	if camera == null or player == null:
 		return
-	mouse_yank_input = Vector2.ZERO
 	var ray_start := camera.project_ray_origin(screen_position)
 	var ray_direction := camera.project_ray_normal(screen_position)
 	var ray_end := ray_start + ray_direction * WEB_RANGE
@@ -152,10 +143,18 @@ func attach_web(screen_position: Vector2):
 	web_anchor = hit_position
 	rope_length = maxf(get_web_origin().distance_to(web_anchor), MIN_ROPE_LENGTH)
 	web_active = true
+	var direction_to_anchor: Vector3 = (
+		web_anchor - get_web_origin()
+	).normalized()
+	player.velocity += (
+		direction_to_anchor
+		* WEB_ATTACH_YANK_IMPULSE
+	)
 
 func release_web():
+	if web_active:
+		jumps_remaining = 2
 	web_active = false
-	mouse_yank_input = Vector2.ZERO
 	if web_mesh != null:
 		web_mesh.clear_surfaces()
 
@@ -173,14 +172,12 @@ func apply_web_physics(delta: float):
 				MAX_SPRING_FORCE
 			)
 			player.velocity -= outward_direction * spring_force * delta
-
 	apply_omnidirectional_swing_control(delta)
-	apply_mouse_yank()
-	if Input.is_key_pressed(KEY_SPACE):
-		rope_length = maxf(MIN_ROPE_LENGTH, rope_length - ROPE_SHORTEN_SPEED * delta)
-		var to_anchor: Vector3 = web_anchor - get_web_origin()
-		if to_anchor.length() > 0.01:
-			player.velocity += to_anchor.normalized() * REEL_PULL_FORCE * delta
+	if Input.is_action_pressed("ui_accept"):
+		rope_length = maxf(
+			MIN_ROPE_LENGTH,
+			rope_length - WEB_CLIMB_SPEED * delta
+		)
 	if player.velocity.length() > MAX_SWING_SPEED:
 		player.velocity = player.velocity.normalized() * MAX_SWING_SPEED
 
@@ -221,20 +218,6 @@ func project_onto_swing_plane(direction: Vector3) -> Vector3:
 		return Vector3.ZERO
 	return projected_direction.normalized()
 
-func apply_mouse_yank():
-	if mouse_yank_input == Vector2.ZERO:
-		return
-	var forward: Vector3 = project_onto_swing_plane(-camera.global_transform.basis.z)
-	var right: Vector3 = project_onto_swing_plane(camera.global_transform.basis.x)
-	var impulse: Vector3 = (
-		right * mouse_yank_input.x * MOUSE_YANK_HORIZONTAL_STRENGTH
-		+ forward * mouse_yank_input.y * MOUSE_YANK_FORWARD_STRENGTH
-	)
-	if impulse.length() > MAX_MOUSE_YANK_IMPULSE:
-		impulse = impulse.normalized() * MAX_MOUSE_YANK_IMPULSE
-	player.velocity += impulse
-	mouse_yank_input = Vector2.ZERO
-
 func enforce_rope_constraint():
 	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
 	var current_distance: float = anchor_to_player.length()
@@ -252,13 +235,45 @@ func get_web_origin() -> Vector3:
 		forward_offset = -camera.global_transform.basis.z * 0.45
 	return player.global_position + Vector3(0.0, 0.75, 0.0) + forward_offset
 
-func update_camera():
+func update_camera(delta: float):
 	if player == null or camera == null:
 		return
-	var horizontal_distance := cos(camera_pitch) * camera_distance
-	var camera_offset := Vector3(sin(camera_yaw) * horizontal_distance, CAMERA_HEIGHT + sin(camera_pitch) * camera_distance, cos(camera_yaw) * horizontal_distance)
-	camera.global_position = player.global_position + camera_offset
-	camera.look_at(player.global_position + Vector3(0.0, 3.5, 0.0), Vector3.UP)
+	camera_pitch = DEFAULT_CAMERA_PITCH
+
+	var horizontal_distance: float = cos(camera_pitch) * DEFAULT_CAMERA_DISTANCE
+	var camera_offset: Vector3 = Vector3(
+		sin(camera_yaw) * horizontal_distance,
+		DEFAULT_CAMERA_HEIGHT + sin(camera_pitch) * DEFAULT_CAMERA_DISTANCE,
+		cos(camera_yaw) * horizontal_distance
+	)
+	var look_target: Vector3 = player.global_position + Vector3(0.0, CAMERA_LOOK_HEIGHT, 0.0)
+	var desired_position: Vector3 = resolve_camera_position(look_target, player.global_position + camera_offset)
+	if not camera_position_initialized:
+		camera.global_position = desired_position
+		camera_position_initialized = true
+	else:
+		var smoothing_weight: float = 1.0 - exp(-CAMERA_POSITION_SMOOTHING * delta)
+		var smoothed_position: Vector3 = camera.global_position.lerp(desired_position, smoothing_weight)
+		camera.global_position = resolve_camera_position(look_target, smoothed_position)
+	camera.look_at(look_target, Vector3.UP)
+
+func resolve_camera_position(look_target: Vector3, desired_position: Vector3) -> Vector3:
+	var ray: Vector3 = desired_position - look_target
+	var ray_length: float = ray.length()
+	if ray_length > 0.01:
+		var query: PhysicsRayQueryParameters3D = PhysicsRayQueryParameters3D.create(
+			look_target,
+			desired_position
+		)
+		query.exclude = [player.get_rid()]
+		query.collide_with_areas = false
+		query.collide_with_bodies = true
+		var result: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
+		if not result.is_empty():
+			var collision_position: Vector3 = result["position"]
+			desired_position = collision_position - ray / ray_length * CAMERA_COLLISION_MARGIN
+	desired_position.y = maxf(desired_position.y, CAMERA_MINIMUM_HEIGHT)
+	return desired_position
 
 func create_web_line():
 	web_mesh = ImmediateMesh.new()
@@ -349,7 +364,7 @@ func create_road_markings():
 func create_player():
 	player = CharacterBody3D.new()
 	player.name = "Player"
-	player.global_position = Vector3(0.0, 4.0, 0.0)
+	player.position = Vector3(0.0, 4.0, 0.0)
 	player.floor_snap_length = 0.3
 
 	var collision := CollisionShape3D.new()
@@ -405,7 +420,7 @@ func create_player():
 	camera.current = true
 	camera.fov = 82.0
 	add_child(camera)
-	update_camera()
+	update_camera(0.0)
 
 func add_hero_part(parent: Node3D, part_name: String, size: Vector3, part_position: Vector3, material: Material):
 	var part := MeshInstance3D.new()
