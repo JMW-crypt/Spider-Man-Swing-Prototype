@@ -13,3 +13,38 @@ config_version=5
 config/name="WebSwingAuto"
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.7")
+
+[input]
+
+move_forward={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":87)]
+}
+move_backward={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":83)]
+}
+move_left={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":65)]
+}
+move_right={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":68)]
+}
+wall_traverse={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":70)]
+}
+rear_web_target={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":81)]
+}
+reset_player={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"physical_keycode":82)]
+}
+traversal_telemetry={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"keycode":4194334)]
+}
