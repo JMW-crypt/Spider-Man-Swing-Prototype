@@ -6,16 +6,31 @@ var web_line: MeshInstance3D
 var web_mesh: ImmediateMesh
 var web_material: StandardMaterial3D
 var web_target_indicator: ColorRect
+var hero_root: Node3D
+var upper_body: Node3D
+var left_arm_pivot: Node3D
+var right_arm_pivot: Node3D
+var left_leg_pivot: Node3D
+var right_leg_pivot: Node3D
+var hand_attachment: Node3D
 var web_active := false
 var web_anchor := Vector3.ZERO
 var rope_length := 0.0
 var web_target_available := false
 var web_target_check_timer := 0.0
+var preferred_web_anchor := Vector3.ZERO
+var web_search_shape: SphereShape3D
+var web_search_query: PhysicsShapeQueryParameters3D
+var web_ray_query: PhysicsRayQueryParameters3D
+var web_candidates: Array[Dictionary] = []
 var camera_panning_enabled := false
 var jumps_remaining := 2
 var camera_yaw: float = 0.0
 var camera_pitch: float = 0.0
 var camera_position_initialized := false
+var run_animation_phase: float = 0.0
+var run_animation_weight: float = 0.0
+var swing_pose_weight: float = 0.0
 
 const GROUND_SPEED := 24.0
 const AIR_SPEED := 28.0
@@ -24,7 +39,16 @@ const AIR_ACCELERATION := 14.0
 const JUMP_FORCE := 26.0
 const GRAVITY := 32.0
 const WEB_RANGE := 300.0
-const WEB_TARGET_ASSIST_RADIUS := 28.0
+const WEB_ASSIST_RADIUS := 110.0
+const WEB_MIN_ANCHOR_HEIGHT := 5.0
+const WEB_CANDIDATE_LIMIT := 24
+const WEB_VISIBILITY_MARGIN := 0.25
+const WEB_SCREEN_SAMPLE_RADIUS := 24.0
+const WEB_TARGET_REFRESH_INTERVAL := 0.15
+const SCORE_HEIGHT_WEIGHT := 0.20
+const SCORE_FORWARD_WEIGHT := 0.20
+const SCORE_MOMENTUM_WEIGHT := 0.40
+const SCORE_DISTANCE_WEIGHT := 0.20
 const WEB_CLIMB_SPEED := 22.0
 const SPRING_STRENGTH := 20.0
 const SPRING_DAMPING := 5.0
@@ -37,6 +61,7 @@ const MAX_SWING_SPEED := 82.0
 const WEB_ATTACH_YANK_IMPULSE := 12.0
 const MIN_ROPE_LENGTH := 7.0
 const MOUSE_SENSITIVITY := 0.003
+const CAMERA_WHEEL_PAN_STEP := 0.12
 const DEFAULT_CAMERA_DISTANCE: float = 14.0
 const DEFAULT_CAMERA_HEIGHT: float = 3.5
 const DEFAULT_CAMERA_PITCH: float = 0.0
@@ -49,6 +74,15 @@ const BUILDING_SPACING := 48
 
 func _ready():
 	randomize()
+	web_search_shape = SphereShape3D.new()
+	web_search_shape.radius = WEB_ASSIST_RADIUS
+	web_search_query = PhysicsShapeQueryParameters3D.new()
+	web_search_query.shape = web_search_shape
+	web_search_query.collide_with_areas = false
+	web_search_query.collide_with_bodies = true
+	web_ray_query = PhysicsRayQueryParameters3D.new()
+	web_ray_query.collide_with_areas = false
+	web_ray_query.collide_with_bodies = true
 	create_floor()
 	create_city()
 	create_player()
@@ -68,6 +102,10 @@ func _input(event):
 				release_web()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			release_web()
+		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
+			camera_yaw -= CAMERA_WHEEL_PAN_STEP
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
+			camera_yaw += CAMERA_WHEEL_PAN_STEP
 	if event is InputEventMouseMotion:
 		if camera_panning_enabled:
 			camera_yaw += event.relative.x * MOUSE_SENSITIVITY
@@ -88,6 +126,7 @@ func _physics_process(delta):
 	player.move_and_slide()
 	if web_active:
 		enforce_rope_constraint()
+	update_character_animation(delta)
 	update_camera(delta)
 	update_web_line()
 	if player.global_position.y < -40.0:
@@ -150,11 +189,14 @@ func attach_web(screen_position: Vector2):
 	)
 
 func find_web_target(screen_position: Vector2) -> Dictionary:
+	var origin := get_web_origin()
+	web_candidates.clear()
+
 	var direct_hit := raycast_web_target(screen_position)
 	if not direct_hit.is_empty():
-		return direct_hit
+		add_web_candidate(direct_hit, true, origin)
 
-	var half_radius: float = WEB_TARGET_ASSIST_RADIUS * 0.5
+	var half_radius := WEB_SCREEN_SAMPLE_RADIUS * 0.5
 	var sample_offsets: Array[Vector2] = [
 		Vector2(-half_radius, 0.0),
 		Vector2(half_radius, 0.0),
@@ -163,37 +205,232 @@ func find_web_target(screen_position: Vector2) -> Dictionary:
 		Vector2(-half_radius, -half_radius),
 		Vector2(half_radius, -half_radius),
 		Vector2(-half_radius, half_radius),
-		Vector2(half_radius, half_radius),
-		Vector2(-WEB_TARGET_ASSIST_RADIUS, 0.0),
-		Vector2(WEB_TARGET_ASSIST_RADIUS, 0.0),
-		Vector2(0.0, -WEB_TARGET_ASSIST_RADIUS),
-		Vector2(0.0, WEB_TARGET_ASSIST_RADIUS)
+		Vector2(half_radius, half_radius)
 	]
 	for offset in sample_offsets:
-		var result := raycast_web_target(screen_position + offset)
-		if not result.is_empty():
-			return result
+		if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+			break
+		var sampled_hit := raycast_web_target(screen_position + offset)
+		if not sampled_hit.is_empty():
+			add_web_candidate(sampled_hit, false, origin)
+
+	web_search_query.transform = Transform3D(Basis.IDENTITY, origin)
+	web_search_query.exclude = [player.get_rid()]
+	var nearby_hits := get_world_3d().direct_space_state.intersect_shape(
+		web_search_query,
+		WEB_CANDIDATE_LIMIT
+	)
+	for nearby_hit in nearby_hits:
+		if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+			break
+		var collider: Object = nearby_hit.get("collider")
+		if not is_valid_web_body(collider):
+			continue
+		add_building_surface_candidates(collider, origin)
+
+	var best_candidate: Dictionary = {}
+	var best_assisted_score := -INF
+	var best_direct_score := -INF
+	var best_direct_candidate: Dictionary = {}
+	for candidate in web_candidates:
+		var anchor: Vector3 = candidate["position"]
+		var body: StaticBody3D = candidate["body"]
+		if not is_web_anchor_visible(origin, anchor, body):
+			continue
+		var score := score_web_candidate(anchor, origin)
+		if candidate["direct"]:
+			if score > best_direct_score:
+				best_direct_score = score
+				best_direct_candidate = candidate
+		elif score > best_assisted_score:
+			best_assisted_score = score
+			best_candidate = candidate
+
+	if not best_direct_candidate.is_empty() and (
+		best_assisted_score == -INF or best_direct_score >= best_assisted_score - 0.08
+	):
+		preferred_web_anchor = best_direct_candidate["position"]
+		return best_direct_candidate
+	if not best_candidate.is_empty():
+		preferred_web_anchor = best_candidate["position"]
+		return best_candidate
+	if not best_direct_candidate.is_empty():
+		preferred_web_anchor = best_direct_candidate["position"]
+		return best_direct_candidate
+	preferred_web_anchor = Vector3.ZERO
 	return {}
+
+func is_valid_web_body(collider: Object) -> bool:
+	return collider is StaticBody3D and collider.name != "CityGround"
+
+func add_web_candidate(hit: Dictionary, direct_aim: bool, origin: Vector3):
+	if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+		return
+	var collider: Object = hit.get("collider")
+	if not is_valid_web_body(collider):
+		return
+	var anchor: Vector3 = hit["position"]
+	if not is_valid_web_anchor(anchor, origin):
+		return
+	for existing in web_candidates:
+		var existing_position: Vector3 = existing["position"]
+		if existing_position.distance_squared_to(anchor) < 1.0:
+			if direct_aim:
+				existing["direct"] = true
+			return
+	web_candidates.append({
+		"position": anchor,
+		"body": collider,
+		"direct": direct_aim
+	})
+
+func add_building_surface_candidates(body: Object, origin: Vector3):
+	var building := body as StaticBody3D
+	for child in building.get_children():
+		if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+			return
+		if not child is CollisionShape3D:
+			continue
+		var collision_shape := child as CollisionShape3D
+		if not collision_shape.shape is BoxShape3D:
+			continue
+		var box_shape := collision_shape.shape as BoxShape3D
+		var half_size: Vector3 = box_shape.size * 0.5
+		var shape_transform := collision_shape.global_transform
+		var center: Vector3 = shape_transform.origin
+		var axis_x: Vector3 = shape_transform.basis.x.normalized()
+		var axis_y: Vector3 = shape_transform.basis.y.normalized()
+		var axis_z: Vector3 = shape_transform.basis.z.normalized()
+		var surface_points: Array[Vector3] = [
+			center + axis_y * half_size.y,
+			center + axis_x * half_size.x,
+			center - axis_x * half_size.x,
+			center + axis_z * half_size.z,
+			center - axis_z * half_size.z
+		]
+		for point in surface_points:
+			if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+				return
+			if not is_valid_web_anchor(point, origin):
+				continue
+			var hit := {"position": point, "collider": building}
+			add_web_candidate(hit, false, origin)
+
+func is_valid_web_anchor(anchor: Vector3, origin: Vector3) -> bool:
+	var height_above_player: float = anchor.y - player.global_position.y
+	var distance: float = origin.distance_to(anchor)
+	return (
+		anchor.y >= 0.0
+		and height_above_player >= WEB_MIN_ANCHOR_HEIGHT
+		and distance <= WEB_ASSIST_RADIUS
+		and distance <= WEB_RANGE
+	)
+
+func is_web_anchor_visible(origin: Vector3, anchor: Vector3, target: StaticBody3D) -> bool:
+	var to_anchor: Vector3 = anchor - origin
+	var distance: float = to_anchor.length()
+	if distance <= WEB_VISIBILITY_MARGIN:
+		return false
+	var ray_end: Vector3 = anchor - to_anchor / distance * WEB_VISIBILITY_MARGIN
+	web_ray_query.from = origin
+	web_ray_query.to = ray_end
+	web_ray_query.exclude = [player.get_rid()]
+	var result: Dictionary = get_world_3d().direct_space_state.intersect_ray(web_ray_query)
+	if result.is_empty():
+		return true
+	return (
+		result.get("collider") == target
+		and Vector3(result["position"]).distance_to(anchor)
+			<= WEB_VISIBILITY_MARGIN * 2.0
+	)
+
+func score_web_candidate(anchor: Vector3, origin: Vector3) -> float:
+	var to_anchor: Vector3 = anchor - origin
+	var distance: float = to_anchor.length()
+	var direction: Vector3 = to_anchor / maxf(distance, 0.001)
+	var height_delta: float = anchor.y - player.global_position.y
+	var preferred_height: float = WEB_ASSIST_RADIUS * 0.45
+	var height_score: float = clampf(
+		1.0 - absf(height_delta - preferred_height) / preferred_height,
+		0.0,
+		1.0
+	)
+
+	var camera_forward: Vector3 = -camera.global_transform.basis.z
+	camera_forward.y = 0.0
+	camera_forward = camera_forward.normalized()
+	var horizontal_direction := Vector3(direction.x, 0.0, direction.z)
+	var forward_score := 0.5
+	if horizontal_direction.length_squared() > 0.0001:
+		forward_score = clampf(
+			(horizontal_direction.normalized().dot(camera_forward) + 1.0) * 0.5,
+			0.0,
+			1.0
+		)
+
+	var speed: float = player.velocity.length()
+	var momentum_score := 0.5
+	if speed > 0.1:
+		var velocity_direction: Vector3 = player.velocity / speed
+		var radial_speed: float = player.velocity.dot(direction)
+		var tangential_velocity: Vector3 = player.velocity - direction * radial_speed
+		var tangent_score: float = tangential_velocity.length() / speed
+		var alignment: float = velocity_direction.dot(direction)
+		var tractor_penalty: float = maxf(alignment, 0.0) * 0.25
+		var reversal_penalty: float = maxf(-alignment, 0.0) * 0.35
+		momentum_score = clampf(
+			tangent_score - tractor_penalty - reversal_penalty,
+			0.0,
+			1.0
+		)
+
+		var camera_right: Vector3 = camera.global_transform.basis.x
+		camera_right.y = 0.0
+		camera_right = camera_right.normalized()
+		var lateral_speed: float = Vector3(
+			player.velocity.x,
+			0.0,
+			player.velocity.z
+		).dot(camera_right)
+		if absf(lateral_speed) > 0.1 and horizontal_direction.length_squared() > 0.0001:
+			var side_alignment: float = horizontal_direction.normalized().dot(camera_right)
+			if lateral_speed < 0.0:
+				side_alignment = -side_alignment
+			var side_score: float = clampf((side_alignment + 1.0) * 0.5, 0.0, 1.0)
+			momentum_score = lerpf(momentum_score, side_score, 0.2)
+
+	var preferred_distance: float = WEB_ASSIST_RADIUS * 0.58
+	var distance_score: float = clampf(
+		1.0 - absf(distance - preferred_distance) / preferred_distance,
+		0.0,
+		1.0
+	)
+	return (
+		height_score * SCORE_HEIGHT_WEIGHT
+		+ forward_score * SCORE_FORWARD_WEIGHT
+		+ momentum_score * SCORE_MOMENTUM_WEIGHT
+		+ distance_score * SCORE_DISTANCE_WEIGHT
+	)
 
 func raycast_web_target(screen_position: Vector2) -> Dictionary:
 	var ray_start := camera.project_ray_origin(screen_position)
 	var ray_direction := camera.project_ray_normal(screen_position)
 	var ray_end := ray_start + ray_direction * WEB_RANGE
-	var query := PhysicsRayQueryParameters3D.create(ray_start, ray_end)
-	query.exclude = [player.get_rid()]
-	query.collide_with_areas = false
-	query.collide_with_bodies = true
-	return get_world_3d().direct_space_state.intersect_ray(query)
+	web_ray_query.from = ray_start
+	web_ray_query.to = ray_end
+	web_ray_query.exclude = [player.get_rid()]
+	return get_world_3d().direct_space_state.intersect_ray(web_ray_query)
 
 func update_web_target_indicator(delta: float):
 	if web_target_indicator == null:
 		return
 	web_target_check_timer -= delta
 	if not web_active and web_target_check_timer <= 0.0:
-		web_target_check_timer = 0.1
-		web_target_available = not find_web_target(
+		web_target_check_timer = WEB_TARGET_REFRESH_INTERVAL
+		var target := find_web_target(
 			get_viewport().get_mouse_position()
-		).is_empty()
+		)
+		web_target_available = not target.is_empty()
 
 	web_target_indicator.position = get_viewport().get_mouse_position() + Vector2(14.0, -4.0)
 	if web_active:
@@ -282,10 +519,86 @@ func enforce_rope_constraint():
 	player.global_position -= outward_direction * (current_distance - rope_length)
 
 func get_web_origin() -> Vector3:
-	var forward_offset := Vector3.ZERO
-	if camera != null:
-		forward_offset = -camera.global_transform.basis.z * 0.45
-	return player.global_position + Vector3(0.0, 0.75, 0.0) + forward_offset
+	if hand_attachment != null:
+		return hand_attachment.global_position
+	return player.global_position + Vector3(0.0, 0.75, 0.0)
+
+func update_character_animation(delta: float):
+	if hero_root == null:
+		return
+
+	var horizontal_velocity := Vector3(player.velocity.x, 0.0, player.velocity.z)
+	var horizontal_speed := horizontal_velocity.length()
+	var target_run_weight := 0.0
+	if player.is_on_floor() and not web_active:
+		target_run_weight = clampf(horizontal_speed / GROUND_SPEED, 0.0, 1.0)
+	var blend := 1.0 - exp(-8.0 * delta)
+	run_animation_weight = lerpf(run_animation_weight, target_run_weight, blend)
+	swing_pose_weight = lerpf(swing_pose_weight, 1.0 if web_active else 0.0, blend)
+
+	if target_run_weight > 0.01:
+		run_animation_phase += delta * lerpf(4.0, 10.0, target_run_weight)
+
+	if horizontal_speed > 0.25:
+		var facing_yaw := atan2(-horizontal_velocity.x, -horizontal_velocity.z)
+		hero_root.rotation.y = lerp_angle(hero_root.rotation.y, facing_yaw, blend)
+
+	var local_velocity := hero_root.global_transform.basis.inverse() * player.velocity
+	var forward_speed := clampf(-local_velocity.z / AIR_SPEED, -1.0, 1.0)
+	var side_speed := clampf(local_velocity.x / AIR_SPEED, -1.0, 1.0)
+	upper_body.rotation.x = lerp_angle(
+		upper_body.rotation.x,
+		-0.12 * forward_speed * swing_pose_weight,
+		blend
+	)
+	upper_body.rotation.z = lerp_angle(
+		upper_body.rotation.z,
+		-0.10 * side_speed * swing_pose_weight,
+		blend
+	)
+
+	var stride := sin(run_animation_phase) * run_animation_weight
+	var trail := clampf(
+		player.velocity.length() / MAX_SWING_SPEED,
+		0.0,
+		1.0
+	) * swing_pose_weight
+	left_leg_pivot.rotation.x = lerpf(
+		left_leg_pivot.rotation.x,
+		stride * 0.65 - trail * 0.55,
+		blend
+	)
+	right_leg_pivot.rotation.x = lerpf(
+		right_leg_pivot.rotation.x,
+		-stride * 0.65 - trail * 0.55,
+		blend
+	)
+	left_arm_pivot.rotation.x = lerpf(
+		left_arm_pivot.rotation.x,
+		-stride * 0.5 + trail * 0.18,
+		blend
+	)
+
+	var run_arm_rotation := Quaternion(Vector3.RIGHT, stride * 0.5)
+	var target_right_arm_rotation := run_arm_rotation
+	if web_active:
+		var anchor_direction: Vector3 = (
+			upper_body.global_transform.basis.inverse()
+			* (web_anchor - right_arm_pivot.global_position)
+		)
+		if anchor_direction.length_squared() > 0.0001:
+			var web_arm_rotation := Quaternion(
+				Vector3.DOWN,
+				anchor_direction.normalized()
+			)
+			target_right_arm_rotation = run_arm_rotation.slerp(
+				web_arm_rotation,
+				swing_pose_weight
+			)
+	right_arm_pivot.quaternion = right_arm_pivot.quaternion.slerp(
+		target_right_arm_rotation,
+		blend
+	)
 
 func update_camera(delta: float):
 	if player == null or camera == null:
@@ -426,9 +739,12 @@ func create_player():
 	collision.shape = capsule_shape
 	player.add_child(collision)
 
-	var hero_root := Node3D.new()
+	hero_root = Node3D.new()
 	hero_root.name = "StylizedHero"
 	player.add_child(hero_root)
+	upper_body = Node3D.new()
+	upper_body.name = "UpperBody"
+	hero_root.add_child(upper_body)
 
 	var suit_blue := StandardMaterial3D.new()
 	suit_blue.albedo_color = Color(0.035, 0.10, 0.42)
@@ -446,12 +762,40 @@ func create_player():
 	eye_white.emission = Color(0.25, 0.42, 0.60)
 	eye_white.emission_energy_multiplier = 1.8
 
-	add_hero_part(hero_root, "Torso", Vector3(0.85, 1.0, 0.46), Vector3(0.0, 0.34, 0.0), suit_blue)
-	add_hero_part(hero_root, "Chest", Vector3(0.91, 0.39, 0.50), Vector3(0.0, 0.58, -0.01), suit_red)
-	add_hero_part(hero_root, "LeftLeg", Vector3(0.29, 0.92, 0.31), Vector3(-0.22, -0.62, 0.0), suit_blue)
-	add_hero_part(hero_root, "RightLeg", Vector3(0.29, 0.92, 0.31), Vector3(0.22, -0.62, 0.0), suit_blue)
-	add_hero_part(hero_root, "LeftArm", Vector3(0.25, 0.92, 0.27), Vector3(-0.57, 0.25, 0.0), suit_red)
-	add_hero_part(hero_root, "RightArm", Vector3(0.25, 0.92, 0.27), Vector3(0.57, 0.25, 0.0), suit_red)
+	add_hero_part(upper_body, "Torso", Vector3(0.85, 1.0, 0.46), Vector3(0.0, 0.34, 0.0), suit_blue)
+	add_hero_part(upper_body, "Chest", Vector3(0.91, 0.39, 0.50), Vector3(0.0, 0.58, -0.01), suit_red)
+	left_leg_pivot = create_limb_pivot(
+		hero_root,
+		"LeftLeg",
+		Vector3(-0.22, -0.16, 0.0),
+		Vector3(0.29, 0.92, 0.31),
+		suit_blue
+	)
+	right_leg_pivot = create_limb_pivot(
+		hero_root,
+		"RightLeg",
+		Vector3(0.22, -0.16, 0.0),
+		Vector3(0.29, 0.92, 0.31),
+		suit_blue
+	)
+	left_arm_pivot = create_limb_pivot(
+		upper_body,
+		"LeftArm",
+		Vector3(-0.57, 0.71, 0.0),
+		Vector3(0.25, 0.92, 0.27),
+		suit_red
+	)
+	right_arm_pivot = create_limb_pivot(
+		upper_body,
+		"RightArm",
+		Vector3(0.57, 0.71, 0.0),
+		Vector3(0.25, 0.92, 0.27),
+		suit_red
+	)
+	hand_attachment = Node3D.new()
+	hand_attachment.name = "WebHandAttachment"
+	hand_attachment.position = Vector3(0.0, -0.92, 0.0)
+	right_arm_pivot.add_child(hand_attachment)
 
 	var head := MeshInstance3D.new()
 	var head_mesh := SphereMesh.new()
@@ -460,10 +804,10 @@ func create_player():
 	head.mesh = head_mesh
 	head.position = Vector3(0.0, 1.05, 0.0)
 	head.material_override = suit_red
-	hero_root.add_child(head)
+	upper_body.add_child(head)
 
-	add_hero_part(hero_root, "LeftEye", Vector3(0.14, 0.22, 0.035), Vector3(-0.12, 1.10, -0.31), eye_white)
-	add_hero_part(hero_root, "RightEye", Vector3(0.14, 0.22, 0.035), Vector3(0.12, 1.10, -0.31), eye_white)
+	add_hero_part(upper_body, "LeftEye", Vector3(0.14, 0.22, 0.035), Vector3(-0.12, 1.10, -0.31), eye_white)
+	add_hero_part(upper_body, "RightEye", Vector3(0.14, 0.22, 0.035), Vector3(0.12, 1.10, -0.31), eye_white)
 
 	add_child(player)
 
@@ -483,6 +827,27 @@ func add_hero_part(parent: Node3D, part_name: String, size: Vector3, part_positi
 	part.position = part_position
 	part.material_override = material
 	parent.add_child(part)
+
+func create_limb_pivot(
+	parent: Node3D,
+	part_name: String,
+	pivot_position: Vector3,
+	size: Vector3,
+	material: Material
+) -> Node3D:
+	var pivot := Node3D.new()
+	pivot.name = part_name + "Pivot"
+	pivot.position = pivot_position
+	var part := MeshInstance3D.new()
+	part.name = part_name
+	var part_mesh := BoxMesh.new()
+	part_mesh.size = size
+	part.mesh = part_mesh
+	part.position = Vector3(0.0, -size.y / 2.0, 0.0)
+	part.material_override = material
+	pivot.add_child(part)
+	parent.add_child(pivot)
+	return pivot
 
 func create_lighting():
 	var sun := DirectionalLight3D.new()
