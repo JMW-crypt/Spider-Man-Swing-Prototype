@@ -1,6 +1,16 @@
 extends Node3D
 
+const SwingTuningScript = preload("res://scripts/traversal/swing_tuning.gd")
+const SwingSolverScript = preload("res://scripts/traversal/swing_solver.gd")
+const LegacySpringSolverScript = preload("res://scripts/traversal/legacy_spring_solver.gd")
+const TraversalMathScript = preload("res://scripts/traversal/traversal_math.gd")
+
+@export var swing_tuning: SwingTuningScript
+@export var swing_solver: SwingSolverScript
+@export var traversal_telemetry_enabled := false
+
 var player: CharacterBody3D
+# player.velocity is authoritative; visual animation is presentation-only.
 var camera: Camera3D
 var web_line: MeshInstance3D
 var web_mesh: ImmediateMesh
@@ -23,59 +33,47 @@ var web_search_shape: SphereShape3D
 var web_search_query: PhysicsShapeQueryParameters3D
 var web_ray_query: PhysicsRayQueryParameters3D
 var web_candidates: Array[Dictionary] = []
-var camera_panning_enabled := false
 var jumps_remaining := 2
 var camera_yaw: float = 0.0
+var camera_follow_yaw: float = 0.0
+var camera_orbit_offset: float = 0.0
+var character_heading_yaw: float = 0.0
 var camera_pitch: float = 0.0
 var camera_position_initialized := false
 var run_animation_phase: float = 0.0
 var run_animation_weight: float = 0.0
 var swing_pose_weight: float = 0.0
-
-const GROUND_SPEED := 24.0
-const AIR_SPEED := 28.0
-const GROUND_ACCELERATION := 60.0
-const AIR_ACCELERATION := 14.0
-const JUMP_FORCE := 26.0
-const GRAVITY := 32.0
-const WEB_RANGE := 300.0
-const WEB_ASSIST_RADIUS := 110.0
-const WEB_MIN_ANCHOR_HEIGHT := 5.0
-const WEB_CANDIDATE_LIMIT := 24
-const WEB_VISIBILITY_MARGIN := 0.25
-const WEB_SCREEN_SAMPLE_RADIUS := 24.0
-const WEB_TARGET_REFRESH_INTERVAL := 0.15
-const SCORE_HEIGHT_WEIGHT := 0.20
-const SCORE_FORWARD_WEIGHT := 0.20
-const SCORE_MOMENTUM_WEIGHT := 0.40
-const SCORE_DISTANCE_WEIGHT := 0.20
-const WEB_CLIMB_SPEED := 22.0
-const SPRING_STRENGTH := 20.0
-const SPRING_DAMPING := 5.0
-const MAX_SPRING_FORCE := 115.0
-const ROPE_SAFETY_STRETCH := 1.5
-const SWING_FORWARD_FORCE := 30.0
-const SWING_SIDE_FORCE := 42.0
-const SWING_REVERSE_FORCE := 24.0
-const MAX_SWING_SPEED := 82.0
-const WEB_ATTACH_YANK_IMPULSE := 12.0
-const MIN_ROPE_LENGTH := 7.0
-const MOUSE_SENSITIVITY := 0.003
-const CAMERA_WHEEL_PAN_STEP := 0.12
-const DEFAULT_CAMERA_DISTANCE: float = 14.0
-const DEFAULT_CAMERA_HEIGHT: float = 3.5
-const DEFAULT_CAMERA_PITCH: float = 0.0
-const CAMERA_POSITION_SMOOTHING: float = 10.0
-const CAMERA_COLLISION_MARGIN: float = 0.5
-const CAMERA_MINIMUM_HEIGHT: float = 0.75
-const CAMERA_LOOK_HEIGHT: float = 1.0
 const CITY_EXTENT := 350
 const BUILDING_SPACING := 48
 
+var telemetry_label: Label
+var telemetry_log_elapsed: float = 0.0
+var telemetry_tick_index: int = 0
+var telemetry_tick_steering_delta := Vector3.ZERO
+var telemetry_tick_spring_delta := Vector3.ZERO
+var telemetry_tick_correction_velocity_delta := Vector3.ZERO
+var telemetry_tick_correction_position_delta := Vector3.ZERO
+var telemetry_last_attach_impulse_delta := Vector3.ZERO
+var telemetry_tick_climb_delta: float = 0.0
+var telemetry_attach_velocity_before := Vector3.ZERO
+var telemetry_attach_velocity_after := Vector3.ZERO
+var telemetry_release_velocity := Vector3.ZERO
+var telemetry_candidate_score: float = -1.0
+var telemetry_radial_speed: float = 0.0
+var telemetry_tangential_velocity := Vector3.ZERO
+var telemetry_collision_count: int = 0
+var telemetry_on_floor := false
+var telemetry_on_wall := false
+var telemetry_on_ceiling := false
+
 func _ready():
 	randomize()
+	if swing_tuning == null:
+		swing_tuning = SwingTuningScript.new()
+	if swing_solver == null:
+		swing_solver = LegacySpringSolverScript.new()
 	web_search_shape = SphereShape3D.new()
-	web_search_shape.radius = WEB_ASSIST_RADIUS
+	web_search_shape.radius = swing_tuning.web_assist_radius
 	web_search_query = PhysicsShapeQueryParameters3D.new()
 	web_search_query.shape = web_search_shape
 	web_search_query.collide_with_areas = false
@@ -95,28 +93,28 @@ func _input(event):
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			if event.pressed:
-				camera_panning_enabled = true
 				attach_web(event.position)
 			else:
-				camera_panning_enabled = false
 				release_web()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			release_web()
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
-			camera_yaw -= CAMERA_WHEEL_PAN_STEP
+			camera_orbit_offset += deg_to_rad(swing_tuning.camera_wheel_rotation_step)
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
-			camera_yaw += CAMERA_WHEEL_PAN_STEP
-	if event is InputEventMouseMotion:
-		if camera_panning_enabled:
-			camera_yaw += event.relative.x * MOUSE_SENSITIVITY
+			camera_orbit_offset -= deg_to_rad(swing_tuning.camera_wheel_rotation_step)
 
 	if event is InputEventKey and event.pressed:
 		if event.keycode == KEY_R:
 			reset_player()
+		elif event.keycode == KEY_F3:
+			traversal_telemetry_enabled = not traversal_telemetry_enabled
+			if telemetry_label != null:
+				telemetry_label.visible = traversal_telemetry_enabled
 
 func _physics_process(delta):
 	if player == null:
 		return
+	reset_traversal_tick_telemetry()
 	update_web_target_indicator(delta)
 	if not web_active and player.is_on_floor():
 		jumps_remaining = 2
@@ -124,6 +122,10 @@ func _physics_process(delta):
 	if web_active:
 		apply_web_physics(delta)
 	player.move_and_slide()
+	telemetry_collision_count = player.get_slide_collision_count()
+	telemetry_on_floor = player.is_on_floor()
+	telemetry_on_wall = player.is_on_wall()
+	telemetry_on_ceiling = player.is_on_ceiling()
 	if web_active:
 		enforce_rope_constraint()
 	update_character_animation(delta)
@@ -131,43 +133,119 @@ func _physics_process(delta):
 	update_web_line()
 	if player.global_position.y < -40.0:
 		reset_player()
+	update_traversal_telemetry(delta)
+
+func reset_traversal_tick_telemetry():
+	telemetry_tick_index += 1
+	telemetry_tick_steering_delta = Vector3.ZERO
+	telemetry_tick_spring_delta = Vector3.ZERO
+	telemetry_tick_correction_velocity_delta = Vector3.ZERO
+	telemetry_tick_correction_position_delta = Vector3.ZERO
+	telemetry_tick_climb_delta = 0.0
+	telemetry_collision_count = 0
+	telemetry_on_floor = false
+	telemetry_on_wall = false
+	telemetry_on_ceiling = false
+
+func update_traversal_telemetry(delta: float):
+	if not traversal_telemetry_enabled:
+		return
+
+	# Telemetry observes authoritative controller state and never feeds traversal.
+	var anchor_distance: float = 0.0
+	var rope_error: float = 0.0
+	telemetry_radial_speed = 0.0
+	telemetry_tangential_velocity = Vector3.ZERO
+	if web_active:
+		var anchor_to_origin: Vector3 = get_web_origin() - web_anchor
+		anchor_distance = anchor_to_origin.length()
+		rope_error = TraversalMathScript.rope_error(anchor_distance, rope_length)
+		var components: Dictionary = TraversalMathScript.decompose_radial_tangential(
+			player.velocity,
+			anchor_to_origin
+		)
+		telemetry_radial_speed = components["radial_speed"]
+		telemetry_tangential_velocity = components["tangential_velocity"]
+
+	var snapshot := {
+		"tick": telemetry_tick_index,
+		"velocity": vector_to_array(player.velocity),
+		"speed": player.velocity.length(),
+		"attached": web_active,
+		"anchor": vector_to_array(web_anchor) if web_active else [],
+		"candidate_score": telemetry_candidate_score,
+		"rope_length": rope_length if web_active else 0.0,
+		"player_anchor_distance": anchor_distance,
+		"rope_error": rope_error,
+		"radial_speed": telemetry_radial_speed,
+		"tangential_velocity": vector_to_array(telemetry_tangential_velocity),
+		"attach_velocity_before": vector_to_array(telemetry_attach_velocity_before),
+		"attach_velocity_after": vector_to_array(telemetry_attach_velocity_after),
+		"release_velocity": vector_to_array(telemetry_release_velocity),
+		"attach_impulse_delta": vector_to_array(telemetry_last_attach_impulse_delta),
+		"steering_delta": vector_to_array(telemetry_tick_steering_delta),
+		"climb_rope_delta": telemetry_tick_climb_delta,
+		"spring_velocity_delta": vector_to_array(telemetry_tick_spring_delta),
+		"correction_velocity_delta": vector_to_array(
+			telemetry_tick_correction_velocity_delta
+		),
+		"correction_position_delta": vector_to_array(
+			telemetry_tick_correction_position_delta
+		),
+		"collision_count": telemetry_collision_count,
+		"collision_state": {
+			"on_floor": telemetry_on_floor,
+			"on_wall": telemetry_on_wall,
+			"on_ceiling": telemetry_on_ceiling
+		}
+	}
+	if telemetry_label != null:
+		telemetry_label.text = JSON.stringify(snapshot, "  ")
+	telemetry_log_elapsed += delta
+	if telemetry_log_elapsed >= 1.0:
+		telemetry_log_elapsed = fmod(telemetry_log_elapsed, 1.0)
+		print("TRAVERSAL_TELEMETRY " + JSON.stringify(snapshot))
+
+func vector_to_array(value: Vector3) -> Array[float]:
+	return [value.x, value.y, value.z]
 
 func handle_player_movement(delta: float):
 	if web_active:
-		player.velocity.y -= GRAVITY * delta
+		player.velocity.y -= swing_tuning.gravity * delta
 		return
 
-	var input_vector := Vector2.ZERO
-	if Input.is_key_pressed(KEY_W):
-		input_vector.y -= 1.0
-	if Input.is_key_pressed(KEY_S):
-		input_vector.y += 1.0
+	var turn_input := 0.0
 	if Input.is_key_pressed(KEY_A):
-		input_vector.x -= 1.0
+		turn_input += 1.0
 	if Input.is_key_pressed(KEY_D):
-		input_vector.x += 1.0
-	if input_vector.length() > 1.0:
-		input_vector = input_vector.normalized()
-	var camera_forward := -camera.global_transform.basis.z
-	var camera_right := camera.global_transform.basis.x
-	camera_forward.y = 0.0
-	camera_right.y = 0.0
-	camera_forward = camera_forward.normalized()
-	camera_right = camera_right.normalized()
-	var desired_direction := camera_right * input_vector.x + camera_forward * -input_vector.y
-	if desired_direction.length() > 0.0:
-		desired_direction = desired_direction.normalized()
+		turn_input -= 1.0
+	character_heading_yaw += turn_input * swing_tuning.character_turn_speed * delta
+
+	var forward_input := 1.0 if Input.is_key_pressed(KEY_W) else 0.0
 	if player.is_on_floor():
-		var target_velocity := desired_direction * GROUND_SPEED
-		player.velocity.x = move_toward(player.velocity.x, target_velocity.x, GROUND_ACCELERATION * delta)
-		player.velocity.z = move_toward(player.velocity.z, target_velocity.z, GROUND_ACCELERATION * delta)
+		forward_input = 1.0 if Input.is_key_pressed(KEY_W) else 0.0
+		var desired_direction := Vector3(
+			-sin(character_heading_yaw),
+			0.0,
+			-cos(character_heading_yaw)
+		)
+		var target_velocity := desired_direction * forward_input * swing_tuning.ground_speed
+		player.velocity.x = move_toward(player.velocity.x, target_velocity.x, swing_tuning.ground_acceleration * delta)
+		player.velocity.z = move_toward(player.velocity.z, target_velocity.z, swing_tuning.ground_acceleration * delta)
 	else:
-		var target_air_velocity := desired_direction * AIR_SPEED
-		player.velocity.x = move_toward(player.velocity.x, target_air_velocity.x, AIR_ACCELERATION * delta)
-		player.velocity.z = move_toward(player.velocity.z, target_air_velocity.z, AIR_ACCELERATION * delta)
-		player.velocity.y -= GRAVITY * delta
+		if Input.is_key_pressed(KEY_S):
+			forward_input -= 1.0
+		var desired_direction := Vector3(
+			-sin(character_heading_yaw),
+			0.0,
+			-cos(character_heading_yaw)
+		)
+		var target_air_velocity := desired_direction * forward_input * swing_tuning.air_speed
+		player.velocity.x = move_toward(player.velocity.x, target_air_velocity.x, swing_tuning.air_acceleration * delta)
+		player.velocity.z = move_toward(player.velocity.z, target_air_velocity.z, swing_tuning.air_acceleration * delta)
+		player.velocity.y -= swing_tuning.gravity * delta
 	if Input.is_action_just_pressed("ui_accept") and jumps_remaining > 0:
-		player.velocity.y = JUMP_FORCE
+		player.velocity.y = swing_tuning.jump_force
 		jumps_remaining -= 1
 
 func attach_web(screen_position: Vector2):
@@ -177,16 +255,20 @@ func attach_web(screen_position: Vector2):
 	if result.is_empty():
 		return
 	var hit_position: Vector3 = result["position"]
+	telemetry_attach_velocity_before = player.velocity
 	web_anchor = hit_position
-	rope_length = maxf(get_web_origin().distance_to(web_anchor), MIN_ROPE_LENGTH)
+	rope_length = maxf(get_web_origin().distance_to(web_anchor), swing_tuning.min_rope_length)
 	web_active = true
 	var direction_to_anchor: Vector3 = (
 		web_anchor - get_web_origin()
 	).normalized()
 	player.velocity += (
 		direction_to_anchor
-		* WEB_ATTACH_YANK_IMPULSE
+		* swing_tuning.web_attach_yank_impulse
 	)
+	telemetry_attach_velocity_after = player.velocity
+	telemetry_last_attach_impulse_delta = player.velocity - telemetry_attach_velocity_before
+	telemetry_candidate_score = float(result.get("score", -1.0))
 
 func find_web_target(screen_position: Vector2) -> Dictionary:
 	var origin := get_web_origin()
@@ -196,7 +278,7 @@ func find_web_target(screen_position: Vector2) -> Dictionary:
 	if not direct_hit.is_empty():
 		add_web_candidate(direct_hit, true, origin)
 
-	var half_radius := WEB_SCREEN_SAMPLE_RADIUS * 0.5
+	var half_radius := swing_tuning.web_screen_sample_radius * 0.5
 	var sample_offsets: Array[Vector2] = [
 		Vector2(-half_radius, 0.0),
 		Vector2(half_radius, 0.0),
@@ -208,7 +290,7 @@ func find_web_target(screen_position: Vector2) -> Dictionary:
 		Vector2(half_radius, half_radius)
 	]
 	for offset in sample_offsets:
-		if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+		if web_candidates.size() >= swing_tuning.web_candidate_limit:
 			break
 		var sampled_hit := raycast_web_target(screen_position + offset)
 		if not sampled_hit.is_empty():
@@ -218,10 +300,10 @@ func find_web_target(screen_position: Vector2) -> Dictionary:
 	web_search_query.exclude = [player.get_rid()]
 	var nearby_hits := get_world_3d().direct_space_state.intersect_shape(
 		web_search_query,
-		WEB_CANDIDATE_LIMIT
+		swing_tuning.web_candidate_limit
 	)
 	for nearby_hit in nearby_hits:
-		if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+		if web_candidates.size() >= swing_tuning.web_candidate_limit:
 			break
 		var collider: Object = nearby_hit.get("collider")
 		if not is_valid_web_body(collider):
@@ -247,24 +329,32 @@ func find_web_target(screen_position: Vector2) -> Dictionary:
 			best_candidate = candidate
 
 	if not best_direct_candidate.is_empty() and (
-		best_assisted_score == -INF or best_direct_score >= best_assisted_score - 0.08
+		best_assisted_score == -INF
+		or best_direct_score >= best_assisted_score - swing_tuning.direct_aim_score_tolerance
 	):
+		best_direct_candidate["score"] = best_direct_score
 		preferred_web_anchor = best_direct_candidate["position"]
+		telemetry_candidate_score = best_direct_score
 		return best_direct_candidate
 	if not best_candidate.is_empty():
+		best_candidate["score"] = best_assisted_score
 		preferred_web_anchor = best_candidate["position"]
+		telemetry_candidate_score = best_assisted_score
 		return best_candidate
 	if not best_direct_candidate.is_empty():
+		best_direct_candidate["score"] = best_direct_score
 		preferred_web_anchor = best_direct_candidate["position"]
+		telemetry_candidate_score = best_direct_score
 		return best_direct_candidate
 	preferred_web_anchor = Vector3.ZERO
+	telemetry_candidate_score = -1.0
 	return {}
 
 func is_valid_web_body(collider: Object) -> bool:
 	return collider is StaticBody3D and collider.name != "CityGround"
 
 func add_web_candidate(hit: Dictionary, direct_aim: bool, origin: Vector3):
-	if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+	if web_candidates.size() >= swing_tuning.web_candidate_limit:
 		return
 	var collider: Object = hit.get("collider")
 	if not is_valid_web_body(collider):
@@ -287,7 +377,7 @@ func add_web_candidate(hit: Dictionary, direct_aim: bool, origin: Vector3):
 func add_building_surface_candidates(body: Object, origin: Vector3):
 	var building := body as StaticBody3D
 	for child in building.get_children():
-		if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+		if web_candidates.size() >= swing_tuning.web_candidate_limit:
 			return
 		if not child is CollisionShape3D:
 			continue
@@ -309,7 +399,7 @@ func add_building_surface_candidates(body: Object, origin: Vector3):
 			center - axis_z * half_size.z
 		]
 		for point in surface_points:
-			if web_candidates.size() >= WEB_CANDIDATE_LIMIT:
+			if web_candidates.size() >= swing_tuning.web_candidate_limit:
 				return
 			if not is_valid_web_anchor(point, origin):
 				continue
@@ -321,17 +411,17 @@ func is_valid_web_anchor(anchor: Vector3, origin: Vector3) -> bool:
 	var distance: float = origin.distance_to(anchor)
 	return (
 		anchor.y >= 0.0
-		and height_above_player >= WEB_MIN_ANCHOR_HEIGHT
-		and distance <= WEB_ASSIST_RADIUS
-		and distance <= WEB_RANGE
+		and height_above_player >= swing_tuning.web_min_anchor_height
+		and distance <= swing_tuning.web_assist_radius
+		and distance <= swing_tuning.web_range
 	)
 
 func is_web_anchor_visible(origin: Vector3, anchor: Vector3, target: StaticBody3D) -> bool:
 	var to_anchor: Vector3 = anchor - origin
 	var distance: float = to_anchor.length()
-	if distance <= WEB_VISIBILITY_MARGIN:
+	if distance <= swing_tuning.web_visibility_margin:
 		return false
-	var ray_end: Vector3 = anchor - to_anchor / distance * WEB_VISIBILITY_MARGIN
+	var ray_end: Vector3 = anchor - to_anchor / distance * swing_tuning.web_visibility_margin
 	web_ray_query.from = origin
 	web_ray_query.to = ray_end
 	web_ray_query.exclude = [player.get_rid()]
@@ -341,7 +431,7 @@ func is_web_anchor_visible(origin: Vector3, anchor: Vector3, target: StaticBody3
 	return (
 		result.get("collider") == target
 		and Vector3(result["position"]).distance_to(anchor)
-			<= WEB_VISIBILITY_MARGIN * 2.0
+			<= swing_tuning.web_visibility_margin * 2.0
 	)
 
 func score_web_candidate(anchor: Vector3, origin: Vector3) -> float:
@@ -349,7 +439,7 @@ func score_web_candidate(anchor: Vector3, origin: Vector3) -> float:
 	var distance: float = to_anchor.length()
 	var direction: Vector3 = to_anchor / maxf(distance, 0.001)
 	var height_delta: float = anchor.y - player.global_position.y
-	var preferred_height: float = WEB_ASSIST_RADIUS * 0.45
+	var preferred_height: float = swing_tuning.web_assist_radius * 0.45
 	var height_score: float = clampf(
 		1.0 - absf(height_delta - preferred_height) / preferred_height,
 		0.0,
@@ -399,23 +489,23 @@ func score_web_candidate(anchor: Vector3, origin: Vector3) -> float:
 			var side_score: float = clampf((side_alignment + 1.0) * 0.5, 0.0, 1.0)
 			momentum_score = lerpf(momentum_score, side_score, 0.2)
 
-	var preferred_distance: float = WEB_ASSIST_RADIUS * 0.58
+	var preferred_distance: float = swing_tuning.web_assist_radius * 0.58
 	var distance_score: float = clampf(
 		1.0 - absf(distance - preferred_distance) / preferred_distance,
 		0.0,
 		1.0
 	)
 	return (
-		height_score * SCORE_HEIGHT_WEIGHT
-		+ forward_score * SCORE_FORWARD_WEIGHT
-		+ momentum_score * SCORE_MOMENTUM_WEIGHT
-		+ distance_score * SCORE_DISTANCE_WEIGHT
+		height_score * swing_tuning.score_height_weight
+		+ forward_score * swing_tuning.score_forward_weight
+		+ momentum_score * swing_tuning.score_momentum_weight
+		+ distance_score * swing_tuning.score_distance_weight
 	)
 
 func raycast_web_target(screen_position: Vector2) -> Dictionary:
 	var ray_start := camera.project_ray_origin(screen_position)
 	var ray_direction := camera.project_ray_normal(screen_position)
-	var ray_end := ray_start + ray_direction * WEB_RANGE
+	var ray_end := ray_start + ray_direction * swing_tuning.web_range
 	web_ray_query.from = ray_start
 	web_ray_query.to = ray_end
 	web_ray_query.exclude = [player.get_rid()]
@@ -426,7 +516,7 @@ func update_web_target_indicator(delta: float):
 		return
 	web_target_check_timer -= delta
 	if not web_active and web_target_check_timer <= 0.0:
-		web_target_check_timer = WEB_TARGET_REFRESH_INTERVAL
+		web_target_check_timer = swing_tuning.web_target_refresh_interval
 		var target := find_web_target(
 			get_viewport().get_mouse_position()
 		)
@@ -442,6 +532,7 @@ func update_web_target_indicator(delta: float):
 
 func release_web():
 	if web_active:
+		telemetry_release_velocity = player.velocity
 		jumps_remaining = 2
 	web_active = false
 	if web_mesh != null:
@@ -449,26 +540,25 @@ func release_web():
 
 func apply_web_physics(delta: float):
 	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
-	var distance: float = anchor_to_player.length()
-	if distance > 0.01:
-		var outward_direction: Vector3 = anchor_to_player / distance
-		var stretch: float = distance - rope_length
-		if stretch > 0.0:
-			var outward_speed: float = player.velocity.dot(outward_direction)
-			var spring_force: float = clampf(
-				stretch * SPRING_STRENGTH + outward_speed * SPRING_DAMPING,
-				0.0,
-				MAX_SPRING_FORCE
-			)
-			player.velocity -= outward_direction * spring_force * delta
+	var spring_delta := swing_solver.calculate_spring_velocity_delta(
+		player.velocity,
+		anchor_to_player,
+		rope_length,
+		delta,
+		swing_tuning
+	)
+	player.velocity += spring_delta
+	telemetry_tick_spring_delta = spring_delta
 	apply_omnidirectional_swing_control(delta)
 	if Input.is_action_pressed("ui_accept"):
+		var previous_rope_length: float = rope_length
 		rope_length = maxf(
-			MIN_ROPE_LENGTH,
-			rope_length - WEB_CLIMB_SPEED * delta
+			swing_tuning.min_rope_length,
+			rope_length - swing_tuning.web_climb_speed * delta
 		)
-	if player.velocity.length() > MAX_SWING_SPEED:
-		player.velocity = player.velocity.normalized() * MAX_SWING_SPEED
+		telemetry_tick_climb_delta = rope_length - previous_rope_length
+	if player.velocity.length() > swing_tuning.max_swing_speed:
+		player.velocity = player.velocity.normalized() * swing_tuning.max_swing_speed
 
 func apply_omnidirectional_swing_control(delta: float):
 	var forward_input: float = 0.0
@@ -491,11 +581,13 @@ func apply_omnidirectional_swing_control(delta: float):
 
 	var forward: Vector3 = project_onto_swing_plane(-camera.global_transform.basis.z)
 	var right: Vector3 = project_onto_swing_plane(camera.global_transform.basis.x)
-	var forward_force: float = SWING_FORWARD_FORCE if forward_input >= 0.0 else SWING_REVERSE_FORCE
+	var forward_force: float = swing_tuning.swing_forward_force if forward_input >= 0.0 else swing_tuning.swing_reverse_force
+	var velocity_before: Vector3 = player.velocity
 	player.velocity += (
 		forward * forward_input * forward_force
-		+ right * side_input * SWING_SIDE_FORCE
+		+ right * side_input * swing_tuning.swing_side_force
 	) * delta
+	telemetry_tick_steering_delta = player.velocity - velocity_before
 
 func project_onto_swing_plane(direction: Vector3) -> Vector3:
 	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
@@ -508,15 +600,18 @@ func project_onto_swing_plane(direction: Vector3) -> Vector3:
 	return projected_direction.normalized()
 
 func enforce_rope_constraint():
-	var anchor_to_player: Vector3 = get_web_origin() - web_anchor
-	var current_distance: float = anchor_to_player.length()
-	if current_distance <= rope_length + ROPE_SAFETY_STRETCH or current_distance <= 0.01:
-		return
-	var outward_direction: Vector3 = anchor_to_player / current_distance
-	var outward_speed: float = player.velocity.dot(outward_direction)
-	if outward_speed > 0.0:
-		player.velocity -= outward_direction * outward_speed
-	player.global_position -= outward_direction * (current_distance - rope_length)
+	var velocity_before: Vector3 = player.velocity
+	var position_before: Vector3 = player.global_position
+	var rope_origin: Vector3 = get_web_origin()
+	swing_solver.apply_post_move_constraint(
+		player,
+		web_anchor,
+		rope_origin,
+		rope_length,
+		swing_tuning
+	)
+	telemetry_tick_correction_velocity_delta += player.velocity - velocity_before
+	telemetry_tick_correction_position_delta += player.global_position - position_before
 
 func get_web_origin() -> Vector3:
 	if hand_attachment != null:
@@ -531,7 +626,7 @@ func update_character_animation(delta: float):
 	var horizontal_speed := horizontal_velocity.length()
 	var target_run_weight := 0.0
 	if player.is_on_floor() and not web_active:
-		target_run_weight = clampf(horizontal_speed / GROUND_SPEED, 0.0, 1.0)
+		target_run_weight = clampf(horizontal_speed / swing_tuning.ground_speed, 0.0, 1.0)
 	var blend := 1.0 - exp(-8.0 * delta)
 	run_animation_weight = lerpf(run_animation_weight, target_run_weight, blend)
 	swing_pose_weight = lerpf(swing_pose_weight, 1.0 if web_active else 0.0, blend)
@@ -539,13 +634,14 @@ func update_character_animation(delta: float):
 	if target_run_weight > 0.01:
 		run_animation_phase += delta * lerpf(4.0, 10.0, target_run_weight)
 
-	if horizontal_speed > 0.25:
-		var facing_yaw := atan2(-horizontal_velocity.x, -horizontal_velocity.z)
-		hero_root.rotation.y = lerp_angle(hero_root.rotation.y, facing_yaw, blend)
+	var facing_yaw := character_heading_yaw
+	if web_active and horizontal_speed > 0.5:
+		facing_yaw = atan2(-horizontal_velocity.x, -horizontal_velocity.z)
+	hero_root.rotation.y = lerp_angle(hero_root.rotation.y, facing_yaw, blend)
 
 	var local_velocity := hero_root.global_transform.basis.inverse() * player.velocity
-	var forward_speed := clampf(-local_velocity.z / AIR_SPEED, -1.0, 1.0)
-	var side_speed := clampf(local_velocity.x / AIR_SPEED, -1.0, 1.0)
+	var forward_speed := clampf(-local_velocity.z / swing_tuning.air_speed, -1.0, 1.0)
+	var side_speed := clampf(local_velocity.x / swing_tuning.air_speed, -1.0, 1.0)
 	upper_body.rotation.x = lerp_angle(
 		upper_body.rotation.x,
 		-0.12 * forward_speed * swing_pose_weight,
@@ -559,7 +655,7 @@ func update_character_animation(delta: float):
 
 	var stride := sin(run_animation_phase) * run_animation_weight
 	var trail := clampf(
-		player.velocity.length() / MAX_SWING_SPEED,
+		player.velocity.length() / swing_tuning.max_swing_speed,
 		0.0,
 		1.0
 	) * swing_pose_weight
@@ -603,21 +699,29 @@ func update_character_animation(delta: float):
 func update_camera(delta: float):
 	if player == null or camera == null:
 		return
-	camera_pitch = DEFAULT_CAMERA_PITCH
+	camera_pitch = swing_tuning.default_camera_pitch
+	camera_follow_yaw = character_heading_yaw
+	if web_active:
+		var horizontal_velocity := Vector2(player.velocity.x, player.velocity.z)
+		if horizontal_velocity.length() > 0.5:
+			camera_follow_yaw = atan2(-horizontal_velocity.x, -horizontal_velocity.y)
+	var target_camera_yaw := camera_follow_yaw + camera_orbit_offset
+	var yaw_blend := 1.0 - exp(-swing_tuning.camera_yaw_follow_smoothing * delta)
+	camera_yaw = lerp_angle(camera_yaw, target_camera_yaw, yaw_blend)
 
-	var horizontal_distance: float = cos(camera_pitch) * DEFAULT_CAMERA_DISTANCE
+	var horizontal_distance: float = cos(camera_pitch) * swing_tuning.default_camera_distance
 	var camera_offset: Vector3 = Vector3(
 		sin(camera_yaw) * horizontal_distance,
-		DEFAULT_CAMERA_HEIGHT + sin(camera_pitch) * DEFAULT_CAMERA_DISTANCE,
+		swing_tuning.default_camera_height + sin(camera_pitch) * swing_tuning.default_camera_distance,
 		cos(camera_yaw) * horizontal_distance
 	)
-	var look_target: Vector3 = player.global_position + Vector3(0.0, CAMERA_LOOK_HEIGHT, 0.0)
+	var look_target: Vector3 = player.global_position + Vector3(0.0, swing_tuning.camera_look_height, 0.0)
 	var desired_position: Vector3 = resolve_camera_position(look_target, player.global_position + camera_offset)
 	if not camera_position_initialized:
 		camera.global_position = desired_position
 		camera_position_initialized = true
 	else:
-		var smoothing_weight: float = 1.0 - exp(-CAMERA_POSITION_SMOOTHING * delta)
+		var smoothing_weight: float = 1.0 - exp(-swing_tuning.camera_position_smoothing * delta)
 		var smoothed_position: Vector3 = camera.global_position.lerp(desired_position, smoothing_weight)
 		camera.global_position = resolve_camera_position(look_target, smoothed_position)
 	camera.look_at(look_target, Vector3.UP)
@@ -636,8 +740,8 @@ func resolve_camera_position(look_target: Vector3, desired_position: Vector3) ->
 		var result: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
 		if not result.is_empty():
 			var collision_position: Vector3 = result["position"]
-			desired_position = collision_position - ray / ray_length * CAMERA_COLLISION_MARGIN
-	desired_position.y = maxf(desired_position.y, CAMERA_MINIMUM_HEIGHT)
+			desired_position = collision_position - ray / ray_length * swing_tuning.camera_collision_margin
+	desired_position.y = maxf(desired_position.y, swing_tuning.camera_minimum_height)
 	return desired_position
 
 func create_web_line():
@@ -1002,10 +1106,16 @@ func create_crosshair():
 	var canvas := CanvasLayer.new()
 	canvas.name = "Interface"
 	var help := Label.new()
-	help.text = "WASD: move and steer | Space: jump/double jump, or climb while attached\nHold left mouse: attach and pan horizontally | Release left mouse: detach and lock camera perspective\nRight mouse: emergency release | R: reset"
+	help.text = "W: move forward | A/D: turn | S: move backward in air only\nSpace: jump/double jump, or climb while attached | Mouse wheel: orbit camera\nHold left mouse: attach | Release left mouse: detach | Right mouse: emergency release | R: reset | F3: telemetry"
 	help.position = Vector2(14.0, 12.0)
 	help.add_theme_font_size_override("font_size", 16)
 	canvas.add_child(help)
+	telemetry_label = Label.new()
+	telemetry_label.name = "TraversalTelemetry"
+	telemetry_label.position = Vector2(14.0, 104.0)
+	telemetry_label.add_theme_font_size_override("font_size", 12)
+	telemetry_label.visible = traversal_telemetry_enabled
+	canvas.add_child(telemetry_label)
 	web_target_indicator = ColorRect.new()
 	web_target_indicator.name = "WebTargetIndicator"
 	web_target_indicator.size = Vector2(8.0, 8.0)
