@@ -5,9 +5,12 @@ var camera: Camera3D
 var web_line: MeshInstance3D
 var web_mesh: ImmediateMesh
 var web_material: StandardMaterial3D
+var web_target_indicator: ColorRect
 var web_active := false
 var web_anchor := Vector3.ZERO
 var rope_length := 0.0
+var web_target_available := false
+var web_target_check_timer := 0.0
 var camera_panning_enabled := false
 var jumps_remaining := 2
 var camera_yaw: float = 0.0
@@ -21,6 +24,7 @@ const AIR_ACCELERATION := 14.0
 const JUMP_FORCE := 26.0
 const GRAVITY := 32.0
 const WEB_RANGE := 300.0
+const WEB_TARGET_ASSIST_RADIUS := 28.0
 const WEB_CLIMB_SPEED := 22.0
 const SPRING_STRENGTH := 20.0
 const SPRING_DAMPING := 5.0
@@ -75,6 +79,7 @@ func _input(event):
 func _physics_process(delta):
 	if player == null:
 		return
+	update_web_target_indicator(delta)
 	if not web_active and player.is_on_floor():
 		jumps_remaining = 2
 	handle_player_movement(delta)
@@ -129,14 +134,7 @@ func handle_player_movement(delta: float):
 func attach_web(screen_position: Vector2):
 	if camera == null or player == null:
 		return
-	var ray_start := camera.project_ray_origin(screen_position)
-	var ray_direction := camera.project_ray_normal(screen_position)
-	var ray_end := ray_start + ray_direction * WEB_RANGE
-	var query := PhysicsRayQueryParameters3D.create(ray_start, ray_end)
-	query.exclude = [player.get_rid()]
-	query.collide_with_areas = false
-	query.collide_with_bodies = true
-	var result: Dictionary = get_world_3d().direct_space_state.intersect_ray(query)
+	var result := find_web_target(screen_position)
 	if result.is_empty():
 		return
 	var hit_position: Vector3 = result["position"]
@@ -150,6 +148,60 @@ func attach_web(screen_position: Vector2):
 		direction_to_anchor
 		* WEB_ATTACH_YANK_IMPULSE
 	)
+
+func find_web_target(screen_position: Vector2) -> Dictionary:
+	var direct_hit := raycast_web_target(screen_position)
+	if not direct_hit.is_empty():
+		return direct_hit
+
+	var half_radius: float = WEB_TARGET_ASSIST_RADIUS * 0.5
+	var sample_offsets: Array[Vector2] = [
+		Vector2(-half_radius, 0.0),
+		Vector2(half_radius, 0.0),
+		Vector2(0.0, -half_radius),
+		Vector2(0.0, half_radius),
+		Vector2(-half_radius, -half_radius),
+		Vector2(half_radius, -half_radius),
+		Vector2(-half_radius, half_radius),
+		Vector2(half_radius, half_radius),
+		Vector2(-WEB_TARGET_ASSIST_RADIUS, 0.0),
+		Vector2(WEB_TARGET_ASSIST_RADIUS, 0.0),
+		Vector2(0.0, -WEB_TARGET_ASSIST_RADIUS),
+		Vector2(0.0, WEB_TARGET_ASSIST_RADIUS)
+	]
+	for offset in sample_offsets:
+		var result := raycast_web_target(screen_position + offset)
+		if not result.is_empty():
+			return result
+	return {}
+
+func raycast_web_target(screen_position: Vector2) -> Dictionary:
+	var ray_start := camera.project_ray_origin(screen_position)
+	var ray_direction := camera.project_ray_normal(screen_position)
+	var ray_end := ray_start + ray_direction * WEB_RANGE
+	var query := PhysicsRayQueryParameters3D.create(ray_start, ray_end)
+	query.exclude = [player.get_rid()]
+	query.collide_with_areas = false
+	query.collide_with_bodies = true
+	return get_world_3d().direct_space_state.intersect_ray(query)
+
+func update_web_target_indicator(delta: float):
+	if web_target_indicator == null:
+		return
+	web_target_check_timer -= delta
+	if not web_active and web_target_check_timer <= 0.0:
+		web_target_check_timer = 0.1
+		web_target_available = not find_web_target(
+			get_viewport().get_mouse_position()
+		).is_empty()
+
+	web_target_indicator.position = get_viewport().get_mouse_position() + Vector2(14.0, -4.0)
+	if web_active:
+		web_target_indicator.color = Color(1.0, 0.72, 0.18, 1.0)
+	elif web_target_available:
+		web_target_indicator.color = Color(0.15, 0.95, 0.78, 1.0)
+	else:
+		web_target_indicator.color = Color(0.38, 0.42, 0.48, 0.75)
 
 func release_web():
 	if web_active:
@@ -585,10 +637,15 @@ func create_crosshair():
 	var canvas := CanvasLayer.new()
 	canvas.name = "Interface"
 	var help := Label.new()
-	help.text = "WASD move | Space jump/reel | Left click attach | Right click release | Middle-drag camera | Wheel tilt | R reset"
+	help.text = "WASD: move and steer | Space: jump/double jump, or climb while attached\nHold left mouse: attach and pan horizontally | Release left mouse: detach and lock camera perspective\nRight mouse: emergency release | R: reset"
 	help.position = Vector2(14.0, 12.0)
-	help.add_theme_font_size_override("font_size", 18)
+	help.add_theme_font_size_override("font_size", 16)
 	canvas.add_child(help)
+	web_target_indicator = ColorRect.new()
+	web_target_indicator.name = "WebTargetIndicator"
+	web_target_indicator.size = Vector2(8.0, 8.0)
+	web_target_indicator.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	canvas.add_child(web_target_indicator)
 	add_child(canvas)
 
 func reset_player():
