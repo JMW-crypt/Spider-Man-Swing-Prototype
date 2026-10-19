@@ -7,6 +7,9 @@ const TraversalMathScript = preload("res://scripts/traversal/traversal_math.gd")
 const WallCrawlTuningScript = preload("res://scripts/traversal/wall_crawl_tuning.gd")
 const WallCrawlControllerScript = preload("res://scripts/traversal/wall_crawl_controller.gd")
 const WallCrawlMathScript = preload("res://scripts/traversal/wall_crawl_math.gd")
+const MixamoHeroPresentationScript = preload(
+	"res://scripts/presentation/mixamo_hero_presentation.gd"
+)
 const REAR_WEB_SHOT_HALF_ANGLE_DEGREES := 60.0
 const REAR_WEB_SHOT_VERTICAL_SLOPES := [0.25, 0.55, 0.9]
 
@@ -31,6 +34,8 @@ var right_arm_pivot: Node3D
 var left_leg_pivot: Node3D
 var right_leg_pivot: Node3D
 var hand_attachment: Node3D
+var procedural_hero_root: Node3D
+var mixamo_hero_presentation: MixamoHeroPresentationScript
 var web_active := false
 var web_rear_shot_active := false
 var web_anchor := Vector3.ZERO
@@ -1228,6 +1233,22 @@ func update_character_animation(delta: float):
 		facing_yaw,
 		wall_pose_weight if wall_crawl_controller.active else blend
 	)
+	if mixamo_hero_presentation != null:
+		var wall_mode := "none"
+		if wall_running:
+			wall_mode = "wall_run"
+		elif wall_crawling:
+			wall_mode = "wall_crawl"
+		mixamo_hero_presentation.update_presentation(
+			delta,
+			player.velocity,
+			player.is_on_floor(),
+			wall_mode,
+			web_active,
+			Input.is_action_just_pressed("ui_accept"),
+			wall_crawl_input_vector()
+		)
+		return
 
 	var local_velocity := hero_root.global_transform.basis.inverse() * player.velocity
 	var forward_speed := clampf(-local_velocity.z / swing_tuning.air_speed, -1.0, 1.0)
@@ -1332,7 +1353,6 @@ func update_camera(delta: float):
 		return
 	camera_pitch = swing_tuning.default_camera_pitch
 	var previous_follow_yaw: float = camera_follow_yaw
-	camera_follow_yaw = character_heading_yaw
 	if wall_crawl_controller.active:
 		camera_follow_yaw = atan2(
 			wall_crawl_controller.wall_normal.x,
@@ -1540,9 +1560,12 @@ func create_player():
 	hero_root = Node3D.new()
 	hero_root.name = "StylizedHero"
 	player.add_child(hero_root)
+	procedural_hero_root = Node3D.new()
+	procedural_hero_root.name = "ProceduralFallback"
+	hero_root.add_child(procedural_hero_root)
 	upper_body = Node3D.new()
 	upper_body.name = "UpperBody"
-	hero_root.add_child(upper_body)
+	procedural_hero_root.add_child(upper_body)
 
 	var suit_blue := StandardMaterial3D.new()
 	suit_blue.albedo_color = Color(0.035, 0.10, 0.42)
@@ -1563,14 +1586,14 @@ func create_player():
 	add_hero_part(upper_body, "Torso", Vector3(0.85, 1.0, 0.46), Vector3(0.0, 0.34, 0.0), suit_blue)
 	add_hero_part(upper_body, "Chest", Vector3(0.91, 0.39, 0.50), Vector3(0.0, 0.58, -0.01), suit_red)
 	left_leg_pivot = create_limb_pivot(
-		hero_root,
+		procedural_hero_root,
 		"LeftLeg",
 		Vector3(-0.22, -0.16, 0.0),
 		Vector3(0.29, 0.92, 0.31),
 		suit_blue
 	)
 	right_leg_pivot = create_limb_pivot(
-		hero_root,
+		procedural_hero_root,
 		"RightLeg",
 		Vector3(0.22, -0.16, 0.0),
 		Vector3(0.29, 0.92, 0.31),
@@ -1608,6 +1631,15 @@ func create_player():
 	add_hero_part(upper_body, "RightEye", Vector3(0.14, 0.22, 0.035), Vector3(0.12, 1.10, -0.31), eye_white)
 
 	add_child(player)
+	mixamo_hero_presentation = MixamoHeroPresentationScript.new()
+	mixamo_hero_presentation.name = "MixamoHeroPresentation"
+	hero_root.add_child(mixamo_hero_presentation)
+	if mixamo_hero_presentation.initialize():
+		procedural_hero_root.visible = false
+		hand_attachment = mixamo_hero_presentation.web_hand_attachment
+	else:
+		mixamo_hero_presentation.queue_free()
+		mixamo_hero_presentation = null
 
 	camera = Camera3D.new()
 	camera.name = "Camera"
