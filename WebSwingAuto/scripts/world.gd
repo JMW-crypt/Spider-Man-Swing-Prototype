@@ -17,6 +17,9 @@ const PresentationFacingScript = preload(
 const MixamoHeroPresentationScript = preload(
 	"res://scripts/presentation/mixamo_hero_presentation.gd"
 )
+const ComicVisualTuningScript = preload(
+	"res://scripts/presentation/comic_visual_tuning.gd"
+)
 const REAR_WEB_SHOT_HALF_ANGLE_DEGREES := 60.0
 const REAR_WEB_SHOT_VERTICAL_SLOPES := [0.25, 0.55, 0.9]
 
@@ -24,6 +27,7 @@ const REAR_WEB_SHOT_VERTICAL_SLOPES := [0.25, 0.55, 0.9]
 @export var swing_solver: SwingSolverScript
 @export var wall_crawl_tuning: WallCrawlTuningScript
 @export var traversal_telemetry_enabled := false
+@export var comic_visual_tuning: ComicVisualTuningScript
 
 enum TraversalState { GROUNDED, AIRBORNE, WALL_RUN, WALL_CRAWLING, WEB_ATTACHED }
 
@@ -34,6 +38,11 @@ var web_line: MeshInstance3D
 var web_mesh: ImmediateMesh
 var web_material: StandardMaterial3D
 var web_target_indicator: ColorRect
+var visual_mode_label: Label
+var world_environment_node: WorldEnvironment
+var current_environment: Environment
+var comic_environment: Environment
+var comic_visual_mode_enabled := false
 var hero_root: Node3D
 var upper_body: Node3D
 var left_arm_pivot: Node3D
@@ -81,6 +90,12 @@ const CITY_EXTENT := 350
 const BUILDING_SPACING := 48
 var building_materials: Array[StandardMaterial3D] = []
 var window_materials: Array[StandardMaterial3D] = []
+var comic_city_meshes: Array[MeshInstance3D] = []
+var comic_city_original_materials: Dictionary = {}
+var comic_city_outline_instances: Array[MeshInstance3D] = []
+var comic_fallback_original_materials: Dictionary = {}
+var comic_fallback_outline_instances: Array[MeshInstance3D] = []
+var comic_fallback_outline_material: ShaderMaterial
 var rooftop_cap_material: StandardMaterial3D
 var wall_crawl_controller: WallCrawlControllerScript = WallCrawlControllerScript.new()
 var wall_ray_query: PhysicsRayQueryParameters3D
@@ -138,6 +153,12 @@ func _ready():
 	create_city()
 	create_player()
 	create_lighting()
+	if comic_visual_tuning == null:
+		comic_visual_tuning = ComicVisualTuningScript.new()
+	comic_environment = comic_visual_tuning.create_comic_environment(
+		current_environment
+	)
+	set_comic_visual_mode(true)
 	create_web_line()
 	create_crosshair()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
@@ -166,6 +187,8 @@ func _input(event):
 			traversal_telemetry_enabled = not traversal_telemetry_enabled
 			if telemetry_label != null:
 				telemetry_label.visible = traversal_telemetry_enabled
+		elif event.is_action_pressed("comic_visual_toggle"):
+			toggle_comic_visual_mode()
 
 func _physics_process(delta):
 	if player == null:
@@ -1592,10 +1615,26 @@ func update_camera(delta: float):
 	var fov_blend: float = 1.0 - exp(-swing_tuning.camera_fov_smoothing * delta)
 	camera.fov = lerpf(camera.fov, target_fov, fov_blend)
 
-	var horizontal_distance: float = cos(camera_pitch) * swing_tuning.default_camera_distance
+	var camera_height_offset: float = swing_tuning.default_camera_height
+	var camera_distance: float = swing_tuning.default_camera_distance
+	var camera_look_height: float = swing_tuning.camera_look_height
+	if comic_visual_mode_enabled:
+		if (
+			not web_active
+			and not wall_crawl_controller.active
+			and player.is_on_floor()
+		):
+			camera_height_offset -= 0.35
+			camera_distance -= 1.0
+			camera_look_height += 0.12
+		elif web_active or wall_crawl_controller.active:
+			camera_distance += 0.75
+			if wall_crawl_controller.mode == WallCrawlControllerScript.Mode.WALL_CRAWL:
+				camera_distance += 0.4
+	var horizontal_distance: float = cos(camera_pitch) * camera_distance
 	var camera_offset: Vector3 = Vector3(
 		sin(camera_yaw) * horizontal_distance,
-		swing_tuning.default_camera_height + sin(camera_pitch) * swing_tuning.default_camera_distance,
+		camera_height_offset + sin(camera_pitch) * camera_distance,
 		cos(camera_yaw) * horizontal_distance
 	)
 	var look_ahead_velocity: Vector3 = (
@@ -1608,7 +1647,7 @@ func update_camera(delta: float):
 		look_ahead = look_ahead.normalized() * swing_tuning.camera_look_ahead_max_distance
 	var look_target: Vector3 = (
 		player.global_position
-		+ Vector3(0.0, swing_tuning.camera_look_height, 0.0)
+		+ Vector3(0.0, camera_look_height, 0.0)
 		+ look_ahead
 	)
 	var desired_position: Vector3 = resolve_camera_position(look_target, player.global_position + camera_offset)
@@ -1999,7 +2038,9 @@ func create_lighting():
 
 	var world_environment := WorldEnvironment.new()
 	world_environment.environment = environment
-	add_child(world_environment)
+	current_environment = environment
+	world_environment_node = world_environment
+	add_child(world_environment_node)
 
 func create_city():
 	create_city_materials()
@@ -2012,6 +2053,151 @@ func create_city():
 			var height := randf_range(35.0, 120.0)
 			var building_position := Vector3(float(x) + randf_range(-4.0, 4.0), height / 2.0, float(z) + randf_range(-4.0, 4.0))
 			create_building(building_position, Vector3(width, height, depth))
+
+func register_comic_city_mesh(mesh_instance: MeshInstance3D) -> void:
+	comic_city_meshes.append(mesh_instance)
+	comic_city_original_materials[mesh_instance.get_instance_id()] = (
+		mesh_instance.material_override
+	)
+
+func toggle_comic_visual_mode() -> void:
+	set_comic_visual_mode(not comic_visual_mode_enabled)
+
+func set_comic_visual_mode(enabled: bool) -> void:
+	if comic_visual_mode_enabled == enabled:
+		return
+	comic_visual_mode_enabled = enabled
+	world_environment_node.environment = (
+		comic_environment if enabled else current_environment
+	)
+	apply_comic_city_visuals(enabled)
+	if mixamo_hero_presentation != null:
+		mixamo_hero_presentation.set_comic_visual_mode(
+			enabled,
+			comic_visual_tuning
+		)
+	else:
+		apply_comic_fallback_visuals(enabled)
+	update_comic_visual_label()
+
+func apply_comic_city_visuals(enabled: bool) -> void:
+	if enabled:
+		var outline_material := comic_visual_tuning.create_outline_material(
+			comic_visual_tuning.building_outline_width_px,
+			comic_visual_tuning.building_outline_color
+		)
+		for mesh_instance in comic_city_meshes:
+			var mesh_id: int = mesh_instance.get_instance_id()
+			var source_material: Material = comic_city_original_materials[mesh_id]
+			mesh_instance.material_override = (
+				comic_visual_tuning.create_toon_material(source_material)
+			)
+			if mesh_instance.name == "BuildingMesh":
+				_ensure_comic_outline(
+					mesh_instance,
+					outline_material,
+					comic_city_outline_instances
+				)
+	for outline_instance in comic_city_outline_instances:
+		if is_instance_valid(outline_instance):
+			outline_instance.visible = enabled
+	for mesh_instance in comic_city_meshes:
+		if not enabled and is_instance_valid(mesh_instance):
+			mesh_instance.material_override = comic_city_original_materials[
+				mesh_instance.get_instance_id()
+			]
+
+func apply_comic_fallback_visuals(enabled: bool) -> void:
+	if procedural_hero_root == null:
+		return
+	if enabled:
+		if comic_fallback_outline_material == null:
+			comic_fallback_outline_material = comic_visual_tuning.create_outline_material(
+				comic_visual_tuning.character_outline_width_px,
+				comic_visual_tuning.character_outline_color
+			)
+		var fallback_meshes: Array[Node] = procedural_hero_root.find_children(
+			"*",
+			"MeshInstance3D",
+			true,
+			false
+		)
+		for mesh_node in fallback_meshes:
+			var mesh_instance := mesh_node as MeshInstance3D
+			if mesh_instance == null or mesh_instance.mesh == null:
+				continue
+			if not comic_fallback_original_materials.has(
+				mesh_instance.get_instance_id()
+			):
+				var original_materials: Array[Material] = []
+				for surface_index in range(mesh_instance.mesh.get_surface_count()):
+					original_materials.append(
+						mesh_instance.get_surface_override_material(surface_index)
+					)
+				comic_fallback_original_materials[
+					mesh_instance.get_instance_id()
+				] = {
+					"mesh": mesh_instance,
+					"materials": original_materials
+				}
+			for surface_index in range(mesh_instance.mesh.get_surface_count()):
+				mesh_instance.set_surface_override_material(
+					surface_index,
+					comic_visual_tuning.create_toon_material(
+						mesh_instance.get_active_material(surface_index)
+					)
+				)
+			_ensure_comic_outline(
+				mesh_instance,
+				comic_fallback_outline_material,
+				comic_fallback_outline_instances
+			)
+	else:
+		for original_id in comic_fallback_original_materials:
+			var original: Dictionary = comic_fallback_original_materials[original_id]
+			var mesh_instance: MeshInstance3D = original["mesh"]
+			if not is_instance_valid(mesh_instance):
+				continue
+			var original_materials: Array = original["materials"]
+			for surface_index in range(original_materials.size()):
+				mesh_instance.set_surface_override_material(
+					surface_index,
+					original_materials[surface_index]
+				)
+	for outline_instance in comic_fallback_outline_instances:
+		if is_instance_valid(outline_instance):
+			outline_instance.visible = enabled
+
+func _ensure_comic_outline(
+	source_mesh: MeshInstance3D,
+	outline_material: ShaderMaterial,
+	outline_instances: Array[MeshInstance3D]
+) -> void:
+	for outline_instance in outline_instances:
+		if (
+			is_instance_valid(outline_instance)
+			and outline_instance.name == source_mesh.name + "ComicOutline"
+			and outline_instance.get_parent() == source_mesh.get_parent()
+		):
+			return
+	var outline_instance := source_mesh.duplicate() as MeshInstance3D
+	if outline_instance == null:
+		push_error("Could not create a comic outline for " + source_mesh.name)
+		return
+	outline_instance.name = source_mesh.name + "ComicOutline"
+	outline_instance.material_override = outline_material
+	outline_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	outline_instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+	source_mesh.get_parent().add_child(outline_instance)
+	outline_instances.append(outline_instance)
+
+func update_comic_visual_label() -> void:
+	if visual_mode_label != null:
+		visual_mode_label.text = (
+			"Visual Mode: Comic Mode (F4 to switch)"
+			if comic_visual_mode_enabled
+			else "Visual Mode: Current Mode (F4 to switch)"
+		)
 
 func create_city_materials():
 	var facade_colors: Array[Color] = [
@@ -2078,10 +2264,12 @@ func create_building(building_position: Vector3, building_size: Vector3):
 	building.position = building_position
 
 	var building_mesh := MeshInstance3D.new()
+	building_mesh.name = "BuildingMesh"
 	var box_mesh := BoxMesh.new()
 	box_mesh.size = building_size
 	building_mesh.mesh = box_mesh
 	building_mesh.material_override = building_materials[randi() % building_materials.size()]
+	register_comic_city_mesh(building_mesh)
 
 	var building_collision := CollisionShape3D.new()
 	var box_shape := BoxShape3D.new()
@@ -2106,6 +2294,7 @@ func add_rooftop_cap(building: StaticBody3D, building_size: Vector3):
 	cap.position = Vector3(0.0, building_size.y / 2.0 + 0.33, 0.0)
 	cap.material_override = rooftop_cap_material
 	building.add_child(cap)
+	register_comic_city_mesh(cap)
 
 func add_window_bands(building: StaticBody3D, building_size: Vector3):
 	var band_count := clampi(int(building_size.y / 16.0), 2, 6)
@@ -2144,15 +2333,22 @@ func add_rooftop_unit(building: StaticBody3D, building_size: Vector3):
 	unit_material.roughness = 0.46
 	unit.material_override = unit_material
 	building.add_child(unit)
+	register_comic_city_mesh(unit)
 
 func create_crosshair():
 	var canvas := CanvasLayer.new()
 	canvas.name = "Interface"
 	var help := Label.new()
-	help.text = "WASD: move, steer, swing, or crawl on a wall | Space: jump/double jump, climb on web, or wall jump\nAirborne or moving into a wall: automatic wall grab | Tap F: detach from a wall\nHold/release left mouse: attach/detach web | Q + left mouse: shoot web behind | Mouse wheel: orbit camera\nRight mouse: emergency web release | R: reset | F3: telemetry"
+	help.text = "WASD: move, steer, swing, or crawl on a wall | Space: jump/double jump, climb on web, or wall jump\nAirborne or moving into a wall: automatic wall grab | Tap F: detach from a wall\nHold/release left mouse: attach/detach web | Q + left mouse: shoot web behind | Mouse wheel: orbit camera\nRight mouse: emergency web release | R: reset | F3: telemetry | F4: visual mode"
 	help.position = Vector2(14.0, 12.0)
 	help.add_theme_font_size_override("font_size", 16)
 	canvas.add_child(help)
+	visual_mode_label = Label.new()
+	visual_mode_label.name = "VisualMode"
+	visual_mode_label.position = Vector2(14.0, 116.0)
+	visual_mode_label.add_theme_font_size_override("font_size", 14)
+	canvas.add_child(visual_mode_label)
+	update_comic_visual_label()
 	telemetry_label = Label.new()
 	telemetry_label.name = "TraversalTelemetry"
 	telemetry_label.position = Vector2(14.0, 150.0)

@@ -4,8 +4,10 @@
 [ext_resource type="Script" path="res://scripts/world.gd" id="1"]
 [ext_resource type="Resource" path="res://resources/default_swing_tuning.tres" id="2"]
 [ext_resource type="Resource" path="res://resources/default_wall_crawl_tuning.tres" id="3"]
+[ext_resource type="Resource" path="res://resources/comic_visual_tuning.tres" id="4"]
 
 [node name="Main" type="Node3D"]
 script = ExtResource("1")
 swing_tuning = ExtResource("2")
 wall_crawl_tuning = ExtResource("3")
+comic_visual_tuning = ExtResource("4")

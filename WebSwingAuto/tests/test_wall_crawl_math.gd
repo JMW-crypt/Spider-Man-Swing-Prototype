@@ -29,6 +29,9 @@ func _initialize():
 	if not _action_has_key("traversal_telemetry", KEY_F3, false):
 		_fail("Telemetry is mapped to F3")
 		return
+	if not _action_has_key("comic_visual_toggle", KEY_F4, false):
+		_fail("Comic visual mode toggle is mapped to F4")
+		return
 
 	var wall_normal := Vector3(0.0, 0.0, 1.0)
 	var projected: Vector3 = WallTraversalMath.project_input_onto_wall_plane(

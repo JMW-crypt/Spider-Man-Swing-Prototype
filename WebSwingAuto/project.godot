@@ -48,3 +48,7 @@ traversal_telemetry={
 "deadzone": 0.5,
 "events": [Object(InputEventKey,"keycode":4194334)]
 }
+comic_visual_toggle={
+"deadzone": 0.5,
+"events": [Object(InputEventKey,"keycode":4194335)]
+}

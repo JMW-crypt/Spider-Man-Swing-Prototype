@@ -37,6 +37,9 @@ const ANIMATION_LIBRARY_NAME := "mixamo"
 const RUN_BLEND_PATH := "parameters/run/blend_position"
 const WALL_CRAWL_BLEND_PATH := "parameters/wall_crawl/blend_position"
 const SPRINT_ANIMATION_SPEED_SCALE := 1.25
+const ComicVisualTuningScript = preload(
+	"res://scripts/presentation/comic_visual_tuning.gd"
+)
 
 var character_root: Node3D
 var model_orientation_root: Node3D
@@ -56,6 +59,9 @@ var flip_source_skeleton_bone_count: int = 0
 var flip_source_root_motion_track_count: int = 0
 var flip_source_root_rotation_track_count: int = 0
 var flip_root_motion_tracks_removed: int = 0
+var comic_original_materials: Dictionary = {}
+var comic_outline_instances: Array[MeshInstance3D] = []
+var comic_outline_material: ShaderMaterial
 
 func initialize() -> bool:
 	var character_scene := ResourceLoader.load(CHARACTER_SCENE_PATH) as PackedScene
@@ -100,6 +106,89 @@ func initialize() -> bool:
 		return false
 	_create_animation_tree()
 	return true
+
+func set_comic_visual_mode(
+	enabled: bool,
+	tuning: ComicVisualTuningScript
+) -> void:
+	if character_root == null:
+		return
+	if enabled and comic_outline_material == null:
+		comic_outline_material = tuning.create_outline_material(
+			tuning.character_outline_width_px,
+			tuning.character_outline_color
+		)
+	var character_meshes: Array[Node] = character_root.find_children(
+		"*",
+		"MeshInstance3D",
+		true,
+		false
+	)
+	for mesh_node in character_meshes:
+		var mesh_instance := mesh_node as MeshInstance3D
+		if (
+			mesh_instance == null
+			or mesh_instance.mesh == null
+			or mesh_instance.name.ends_with("ComicOutline")
+		):
+			continue
+		_store_original_materials(mesh_instance)
+		if enabled:
+			for surface_index in range(mesh_instance.mesh.get_surface_count()):
+				var source_material: Material = mesh_instance.get_active_material(
+					surface_index
+				)
+				mesh_instance.set_surface_override_material(
+					surface_index,
+					tuning.create_toon_material(source_material)
+				)
+			_ensure_outline_instance(mesh_instance)
+		else:
+			_restore_original_materials(mesh_instance)
+	for outline_instance in comic_outline_instances:
+		if is_instance_valid(outline_instance):
+			outline_instance.visible = enabled
+
+func _store_original_materials(mesh_instance: MeshInstance3D) -> void:
+	var mesh_id: int = mesh_instance.get_instance_id()
+	if comic_original_materials.has(mesh_id):
+		return
+	var materials: Array[Material] = []
+	for surface_index in range(mesh_instance.mesh.get_surface_count()):
+		materials.append(mesh_instance.get_surface_override_material(surface_index))
+	comic_original_materials[mesh_id] = {
+		"mesh": mesh_instance,
+		"materials": materials
+	}
+
+func _restore_original_materials(mesh_instance: MeshInstance3D) -> void:
+	var mesh_id: int = mesh_instance.get_instance_id()
+	if not comic_original_materials.has(mesh_id):
+		return
+	var original: Dictionary = comic_original_materials[mesh_id]
+	var materials: Array = original["materials"]
+	for surface_index in range(materials.size()):
+		mesh_instance.set_surface_override_material(
+			surface_index,
+			materials[surface_index]
+		)
+
+func _ensure_outline_instance(source_mesh: MeshInstance3D) -> void:
+	for outline_instance in comic_outline_instances:
+		if is_instance_valid(outline_instance) and outline_instance.name == (
+			source_mesh.name + "ComicOutline"
+		):
+			return
+	var outline_instance := source_mesh.duplicate() as MeshInstance3D
+	if outline_instance == null:
+		push_error("Could not create a comic outline for " + source_mesh.name)
+		return
+	outline_instance.name = source_mesh.name + "ComicOutline"
+	outline_instance.material_override = comic_outline_material
+	outline_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	outline_instance.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+	source_mesh.get_parent().add_child(outline_instance)
+	comic_outline_instances.append(outline_instance)
 
 func _build_retargeted_animation_library() -> bool:
 	var animation_library := AnimationLibrary.new()
