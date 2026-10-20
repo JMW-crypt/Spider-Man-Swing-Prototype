@@ -34,9 +34,25 @@ extends Resource
 @export var max_swing_speed: float = 82.0
 @export var web_attach_yank_impulse: float = 12.0
 @export var min_rope_length: float = 7.0
+@export var web_zip_acceleration: float = 90.0
+@export var web_zip_max_speed: float = 70.0
+@export var web_zip_arrival_distance: float = 2.0
 
 @export var camera_wheel_rotation_step: float = 15.0
 @export var camera_yaw_follow_smoothing: float = 7.5
+@export var camera_diagonal_yaw_enabled: bool = true
+@export var camera_diagonal_yaw_speed_degrees: float = 75.0
+@export var camera_diagonal_yaw_acceleration_degrees: float = 180.0
+@export var camera_diagonal_yaw_deceleration_degrees: float = 240.0
+@export var camera_diagonal_yaw_max_velocity_degrees: float = 75.0
+@export_range(0.0, 1.0, 0.01) var camera_diagonal_yaw_min_forward_input: float = 0.5
+@export_range(0.0, 1.0, 0.01) var camera_diagonal_yaw_min_lateral_input: float = 0.5
+@export var camera_diagonal_yaw_allowed_states: PackedStringArray = PackedStringArray([
+	"grounded",
+	"airborne",
+	"web_attached",
+	"wall_run"
+])
 @export var character_turn_speed: float = 1.2
 @export var default_camera_distance: float = 14.0
 @export var default_camera_height: float = 3.5

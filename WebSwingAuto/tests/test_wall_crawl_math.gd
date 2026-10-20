@@ -251,6 +251,20 @@ func _initialize():
 	if WallTraversalMath.resolve_space_action(false, false, false, 1) != WallTraversalMath.SPACE_ACTION_DOUBLE_JUMP:
 		_fail("Space while airborne remains a double jump")
 		return
+	if WallTraversalMath.resolve_jumps_after_wall_jump(0, true) != 2:
+		_fail("Wall jump restores the double-jump allowance")
+		return
+	if WallTraversalMath.resolve_space_action(
+		false,
+		false,
+		false,
+		WallTraversalMath.resolve_jumps_after_wall_jump(0, true)
+	) != WallTraversalMath.SPACE_ACTION_DOUBLE_JUMP:
+		_fail("Space after a wall jump can consume the restored double jump")
+		return
+	if WallTraversalMath.resolve_jumps_after_wall_jump(1, false) != 0:
+		_fail("Wall-jump tuning can consume one remaining jump")
+		return
 
 	var assisted_controller = WallTraversalController.new()
 	var assisted_tuning = WallTraversalTuning.new()

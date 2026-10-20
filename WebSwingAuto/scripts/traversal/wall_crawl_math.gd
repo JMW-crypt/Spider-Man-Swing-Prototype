@@ -44,6 +44,14 @@ static func resolve_space_action(
 		return SPACE_ACTION_DOUBLE_JUMP
 	return SPACE_ACTION_NONE
 
+static func resolve_jumps_after_wall_jump(
+	jumps_remaining: int,
+	preserve_double_jump: bool
+) -> int:
+	if preserve_double_jump:
+		return 2
+	return maxi(jumps_remaining - 1, 0)
+
 static func can_enter_wall_traversal(
 	enabled: bool,
 	input_held: bool,

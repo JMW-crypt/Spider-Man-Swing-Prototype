@@ -7,6 +7,13 @@ const TraversalMathScript = preload("res://scripts/traversal/traversal_math.gd")
 const WallCrawlTuningScript = preload("res://scripts/traversal/wall_crawl_tuning.gd")
 const WallCrawlControllerScript = preload("res://scripts/traversal/wall_crawl_controller.gd")
 const WallCrawlMathScript = preload("res://scripts/traversal/wall_crawl_math.gd")
+const WebZipSteeringScript = preload("res://scripts/traversal/web_zip_steering.gd")
+const CameraDiagonalSteeringScript = preload(
+	"res://scripts/traversal/camera_diagonal_steering.gd"
+)
+const PresentationFacingScript = preload(
+	"res://scripts/presentation/presentation_facing.gd"
+)
 const MixamoHeroPresentationScript = preload(
 	"res://scripts/presentation/mixamo_hero_presentation.gd"
 )
@@ -37,6 +44,7 @@ var hand_attachment: Node3D
 var procedural_hero_root: Node3D
 var mixamo_hero_presentation: MixamoHeroPresentationScript
 var web_active := false
+var web_zip_active := false
 var web_rear_shot_active := false
 var web_anchor := Vector3.ZERO
 var rope_length := 0.0
@@ -51,7 +59,18 @@ var jumps_remaining := 2
 var camera_yaw: float = 0.0
 var camera_follow_yaw: float = 0.0
 var camera_orbit_offset: float = 0.0
+var camera_diagonal_yaw_velocity: float = 0.0
+var camera_diagonal_yaw_target_velocity: float = 0.0
+var camera_diagonal_yaw_direction: float = 0.0
+var camera_diagonal_yaw_traversal_allowed := false
+var camera_diagonal_yaw_inactive_reason: String = "not_updated"
 var character_heading_yaw: float = 0.0
+var movement_input_snapshot := Vector2.ZERO
+var movement_action_strength_snapshot := Vector4.ZERO
+var visual_facing_rule: String = "stable"
+var visual_target_forward := Vector3.FORWARD
+var visual_target_up := Vector3.UP
+var resetting_player := false
 var camera_pitch: float = 0.0
 var camera_bank: float = 0.0
 var camera_position_initialized := false
@@ -83,6 +102,7 @@ var telemetry_tick_correction_velocity_delta := Vector3.ZERO
 var telemetry_tick_correction_position_delta := Vector3.ZERO
 var telemetry_last_attach_impulse_delta := Vector3.ZERO
 var telemetry_tick_climb_delta: float = 0.0
+var telemetry_tick_web_zip_delta := Vector3.ZERO
 var telemetry_attach_velocity_before := Vector3.ZERO
 var telemetry_attach_velocity_after := Vector3.ZERO
 var telemetry_release_velocity := Vector3.ZERO
@@ -126,8 +146,11 @@ func _input(event):
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			if event.pressed:
-				attach_web(event.position, Input.is_action_pressed("rear_web_target"))
-			else:
+				if event.double_click:
+					webzip(event.position, Input.is_action_pressed("rear_web_target"))
+				else:
+					attach_web(event.position, Input.is_action_pressed("rear_web_target"))
+			elif not web_zip_active:
 				release_web()
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
 			release_web()
@@ -148,6 +171,8 @@ func _physics_process(delta):
 	if player == null:
 		return
 	reset_traversal_tick_telemetry()
+	space_context_action = "none"
+	movement_input_snapshot = capture_movement_input_snapshot()
 	wall_crawl_controller.advance_cooldown(delta)
 	wall_detected = false
 	detected_wall_candidate.clear()
@@ -207,6 +232,7 @@ func _physics_process(delta):
 	if player.global_position.y < -40.0:
 		reset_player()
 	update_traversal_telemetry(delta)
+	resetting_player = false
 
 func update_traversal_state(reason: String):
 	var wall_state: int = WallCrawlMathScript.STATE_AIRBORNE
@@ -230,10 +256,20 @@ func set_traversal_state(next_state: int, reason: String):
 	traversal_state = next_state
 	last_transition_reason = reason
 
-func wall_crawl_input_vector() -> Vector2:
+func capture_movement_input_snapshot() -> Vector2:
+	var forward_strength: float = Input.get_action_strength("move_forward")
+	var backward_strength: float = Input.get_action_strength("move_backward")
+	var left_strength: float = Input.get_action_strength("move_left")
+	var right_strength: float = Input.get_action_strength("move_right")
+	movement_action_strength_snapshot = Vector4(
+		forward_strength,
+		backward_strength,
+		left_strength,
+		right_strength
+	)
 	var crawl_input := Vector2(
-		Input.get_action_strength("move_right") - Input.get_action_strength("move_left"),
-		Input.get_action_strength("move_forward") - Input.get_action_strength("move_backward")
+		right_strength - left_strength,
+		forward_strength - backward_strength
 	)
 	return WallCrawlMathScript.normalize_wall_input(crawl_input)
 
@@ -294,8 +330,10 @@ func update_active_wall_traversal(
 			true,
 			true
 		)
-		if not wall_crawl_tuning.preserve_double_jump_after_wall_jump and jumps_remaining > 0:
-			jumps_remaining -= 1
+		jumps_remaining = WallCrawlMathScript.resolve_jumps_after_wall_jump(
+			jumps_remaining,
+			wall_crawl_tuning.preserve_double_jump_after_wall_jump
+		)
 		space_context_action = "wall_jump"
 		set_traversal_state(TraversalState.AIRBORNE, "wall_jump")
 		return true
@@ -303,7 +341,7 @@ func update_active_wall_traversal(
 		wall_crawl_controller.exit(player, wall_crawl_tuning, "manual_detach")
 		set_traversal_state(TraversalState.AIRBORNE, "wall_manual_detach")
 		return false
-	var crawl_input: Vector2 = wall_crawl_input_vector()
+	var crawl_input: Vector2 = movement_input_snapshot
 	var candidate: Dictionary = find_wall_candidate(wall_crawl_controller.wall_normal)
 	if candidate.is_empty():
 		wall_detected = false
@@ -473,6 +511,7 @@ func reset_traversal_tick_telemetry():
 	telemetry_tick_correction_velocity_delta = Vector3.ZERO
 	telemetry_tick_correction_position_delta = Vector3.ZERO
 	telemetry_tick_climb_delta = 0.0
+	telemetry_tick_web_zip_delta = Vector3.ZERO
 	telemetry_collision_count = 0
 	telemetry_on_floor = false
 	telemetry_on_wall = false
@@ -498,7 +537,34 @@ func update_traversal_telemetry(delta: float):
 		telemetry_radial_speed = components["radial_speed"]
 		telemetry_tangential_velocity = components["tangential_velocity"]
 
-	var wall_input_snapshot: Vector2 = wall_crawl_input_vector()
+	var wall_input_snapshot: Vector2 = movement_input_snapshot
+	var telemetry_wall_normal: Vector3 = (
+		wall_crawl_controller.wall_normal
+		if wall_crawl_controller.active
+		else Vector3.ZERO
+	)
+	var current_visual_forward: Vector3 = get_current_visual_forward()
+	var chest_to_wall_alignment_active: bool = (
+		wall_crawl_controller.active
+		and current_visual_forward.dot(-telemetry_wall_normal) >= 0.9
+	)
+	var back_to_camera_wall_presentation_active: bool = false
+	if chest_to_wall_alignment_active and camera != null:
+		var camera_outward_direction: Vector3 = (
+			camera.global_position - player.global_position
+		).normalized()
+		back_to_camera_wall_presentation_active = (
+			camera_outward_direction.dot(telemetry_wall_normal) > 0.0
+		)
+	var active_animation_state: String = (
+		mixamo_hero_presentation.get_active_animation_state()
+		if mixamo_hero_presentation != null
+		else "procedural_fallback"
+	)
+	var flip_active: bool = (
+		mixamo_hero_presentation != null
+		and active_animation_state == MixamoHeroPresentationScript.DOUBLE_JUMP_FLIP_STATE
+	)
 	var snapshot := {
 		"tick": telemetry_tick_index,
 		"velocity": vector_to_array(player.velocity),
@@ -518,6 +584,13 @@ func update_traversal_telemetry(delta: float):
 		"attach_impulse_delta": vector_to_array(telemetry_last_attach_impulse_delta),
 		"steering_delta": vector_to_array(telemetry_tick_steering_delta),
 		"climb_rope_delta": telemetry_tick_climb_delta,
+		"web_zip_active": web_zip_active,
+		"web_zip_target_distance": (
+			anchor_distance
+			if web_zip_active and web_active
+			else 0.0
+		),
+		"web_zip_velocity_delta": vector_to_array(telemetry_tick_web_zip_delta),
 		"spring_velocity_delta": vector_to_array(telemetry_tick_spring_delta),
 		"correction_velocity_delta": vector_to_array(
 			telemetry_tick_correction_velocity_delta
@@ -534,6 +607,53 @@ func update_traversal_telemetry(delta: float):
 		"traversal_state": get_traversal_state_name(),
 		"previous_traversal_state": get_traversal_state_name(previous_traversal_state),
 		"transition_reason": last_transition_reason,
+		"visual_forward_correction": (
+			mixamo_hero_presentation.model_orientation_root.rotation.y
+			if mixamo_hero_presentation != null
+			else 0.0
+		),
+		"active_traversal_state": get_traversal_state_name(),
+		"visual_facing_rule": visual_facing_rule,
+		"visual_target_forward": vector_to_array(visual_target_forward),
+		"visual_target_up": vector_to_array(visual_target_up),
+		"visual_facing_yaw": hero_root.rotation.y,
+		"visual_forward": vector_to_array(current_visual_forward),
+		"movement_direction": [movement_input_snapshot.x, movement_input_snapshot.y],
+		"movement_action_strengths": [
+			movement_action_strength_snapshot.x,
+			movement_action_strength_snapshot.y,
+			movement_action_strength_snapshot.z,
+			movement_action_strength_snapshot.w
+		],
+		"active_animation_state": active_animation_state,
+		"chest_to_wall_alignment_active": chest_to_wall_alignment_active,
+		"back_to_camera_wall_presentation_active": (
+			back_to_camera_wall_presentation_active
+		),
+		"double_jump_flip_active": flip_active,
+		"double_jump_flip_normalized_time": (
+			mixamo_hero_presentation.get_flip_normalized_time()
+			if mixamo_hero_presentation != null
+			else 0.0
+		),
+		"camera_diagonal_yaw": {
+			"enabled": swing_tuning.camera_diagonal_yaw_enabled,
+			"forward_input": movement_action_strength_snapshot.x,
+			"lateral_input": (
+				movement_action_strength_snapshot.w
+				- movement_action_strength_snapshot.z
+			),
+			"requested_yaw_direction": camera_diagonal_yaw_direction,
+			"target_yaw_velocity_degrees": rad_to_deg(
+				camera_diagonal_yaw_target_velocity
+			),
+			"current_yaw_velocity_degrees": rad_to_deg(
+				camera_diagonal_yaw_velocity
+			),
+			"current_camera_yaw_degrees": rad_to_deg(camera_yaw),
+			"traversal_state_allowed": camera_diagonal_yaw_traversal_allowed,
+			"inactive_reason": camera_diagonal_yaw_inactive_reason
+		},
 		"space_context_action": space_context_action,
 		"space_input": {
 			"pressed": Input.is_action_just_pressed("ui_accept"),
@@ -634,7 +754,7 @@ func handle_player_movement(delta: float, allow_jump: bool = true):
 			space_context_action = "web_climb"
 		return
 
-	var movement_input: Vector2 = wall_crawl_input_vector()
+	var movement_input: Vector2 = movement_input_snapshot
 	var camera_forward := Vector3(-sin(camera_yaw), 0.0, -cos(camera_yaw))
 	var camera_right := Vector3(cos(camera_yaw), 0.0, -sin(camera_yaw))
 	var desired_direction: Vector3 = (
@@ -643,8 +763,11 @@ func handle_player_movement(delta: float, allow_jump: bool = true):
 	)
 	if desired_direction.length_squared() > 0.0001:
 		desired_direction = desired_direction.normalized()
-		if movement_input.y > 0.01:
-			character_heading_yaw = atan2(-desired_direction.x, -desired_direction.z)
+		character_heading_yaw = PresentationFacingScript.locomotion_yaw(
+			character_heading_yaw,
+			desired_direction,
+			movement_input.y
+		)
 
 	if player.is_on_floor():
 		var target_velocity: Vector3 = desired_direction * swing_tuning.ground_speed
@@ -681,7 +804,21 @@ func attach_web(screen_position: Vector2, rear_shot: bool = false):
 	var result := find_web_target(screen_position, rear_shot)
 	if result.is_empty():
 		return
+	attach_web_target(result, rear_shot)
+
+func webzip(screen_position: Vector2, rear_shot: bool = false):
+	if camera == null or player == null:
+		return
+	var result := find_web_target(screen_position, rear_shot)
+	if result.is_empty():
+		return
+	attach_web_target(result, rear_shot)
+	web_zip_active = true
+
+func attach_web_target(result: Dictionary, rear_shot: bool):
+	var hit_position: Vector3 = result["position"]
 	var overrode_wall_traversal: bool = wall_crawl_controller.active
+	web_zip_active = false
 	if wall_crawl_controller.active:
 		wall_crawl_controller.exit(
 			player,
@@ -691,7 +828,6 @@ func attach_web(screen_position: Vector2, rear_shot: bool = false):
 			false
 		)
 		wall_web_transition = "wall_to_web"
-	var hit_position: Vector3 = result["position"]
 	telemetry_attach_velocity_before = player.velocity
 	web_anchor = hit_position
 	web_rear_shot_active = rear_shot
@@ -1102,6 +1238,7 @@ func release_web(update_traversal_state: bool = true):
 		telemetry_release_velocity = player.velocity
 		jumps_remaining = 2
 	web_active = false
+	web_zip_active = false
 	web_rear_shot_active = false
 	if update_traversal_state and traversal_state == TraversalState.WEB_ATTACHED:
 		set_traversal_state(TraversalState.AIRBORNE, "web_released")
@@ -1127,11 +1264,31 @@ func apply_web_physics(delta: float):
 			rope_length - swing_tuning.web_climb_speed * delta
 		)
 		telemetry_tick_climb_delta = rope_length - previous_rope_length
+	if web_zip_active:
+		var web_origin: Vector3 = get_web_origin()
+		var distance_to_anchor: float = web_origin.distance_to(web_anchor)
+		if WebZipSteeringScript.has_arrived(
+			distance_to_anchor,
+			swing_tuning.web_zip_arrival_distance
+		):
+			release_web()
+			return
+		var velocity_before_web_zip: Vector3 = player.velocity
+		player.velocity = WebZipSteeringScript.approach_anchor_velocity(
+			player.velocity,
+			web_anchor - web_origin,
+			swing_tuning.web_zip_max_speed,
+			swing_tuning.web_zip_acceleration,
+			delta,
+			distance_to_anchor,
+			swing_tuning.web_zip_arrival_distance
+		)
+		telemetry_tick_web_zip_delta = player.velocity - velocity_before_web_zip
 	if player.velocity.length() > swing_tuning.max_swing_speed:
 		player.velocity = player.velocity.normalized() * swing_tuning.max_swing_speed
 
 func apply_omnidirectional_swing_control(delta: float):
-	var input_vector: Vector2 = wall_crawl_input_vector()
+	var input_vector: Vector2 = movement_input_snapshot
 	if input_vector == Vector2.ZERO:
 		return
 	var side_input: float = input_vector.x
@@ -1221,13 +1378,36 @@ func update_character_animation(delta: float):
 		run_animation_phase += delta * lerpf(4.0, 10.0, target_run_weight)
 
 	var facing_yaw := character_heading_yaw
+	visual_facing_rule = "grounded_or_airborne"
 	if wall_crawl_controller.active:
-		facing_yaw = atan2(
-			wall_crawl_controller.wall_normal.x,
-			wall_crawl_controller.wall_normal.z
+		visual_facing_rule = (
+			"wall_run"
+			if wall_running
+			else "wall_crawl"
+		)
+		facing_yaw = PresentationFacingScript.yaw_for_wall_normal(
+			wall_crawl_controller.wall_normal
 		)
 	elif web_active and horizontal_speed > 0.5:
-		facing_yaw = atan2(-horizontal_velocity.x, -horizontal_velocity.z)
+		visual_facing_rule = "web_attached"
+		facing_yaw = PresentationFacingScript.yaw_for_forward(horizontal_velocity)
+	elif (
+		space_context_action == "double_jump"
+		or (
+			mixamo_hero_presentation != null
+			and mixamo_hero_presentation.get_active_animation_state()
+				== MixamoHeroPresentationScript.DOUBLE_JUMP_FLIP_STATE
+		)
+	):
+		visual_facing_rule = "double_jump_flip"
+		if horizontal_speed > 0.5:
+			facing_yaw = PresentationFacingScript.yaw_for_forward(
+				horizontal_velocity
+			)
+	elif horizontal_speed > 0.5:
+		visual_facing_rule = "airborne_movement" if not player.is_on_floor() else "ground_movement"
+	visual_target_forward = PresentationFacingScript.forward_for_yaw(facing_yaw)
+	visual_target_up = Vector3.UP
 	hero_root.rotation.y = lerp_angle(
 		hero_root.rotation.y,
 		facing_yaw,
@@ -1245,8 +1425,9 @@ func update_character_animation(delta: float):
 			player.is_on_floor(),
 			wall_mode,
 			web_active,
-			Input.is_action_just_pressed("ui_accept"),
-			wall_crawl_input_vector()
+			space_context_action,
+			movement_input_snapshot,
+			wall_crawl_controller.tangent_velocity
 		)
 		return
 
@@ -1362,6 +1543,7 @@ func update_camera(delta: float):
 		var horizontal_velocity := Vector2(player.velocity.x, player.velocity.z)
 		if horizontal_velocity.length() > 0.5:
 			camera_follow_yaw = atan2(-horizontal_velocity.x, -horizontal_velocity.y)
+	update_camera_diagonal_steering(delta)
 	var follow_turn_rate: float = 0.0
 	if camera_position_initialized and delta > 0.0001:
 		follow_turn_rate = wrapf(
@@ -1439,6 +1621,94 @@ func update_camera(delta: float):
 		camera.global_position = resolve_camera_position(look_target, smoothed_position)
 	camera.look_at(look_target, Vector3.UP)
 	camera.rotate_object_local(Vector3.FORWARD, camera_bank)
+
+func update_camera_diagonal_steering(delta: float) -> void:
+	var state_name: String = get_traversal_state_name()
+	camera_diagonal_yaw_traversal_allowed = (
+		state_name in swing_tuning.camera_diagonal_yaw_allowed_states
+	)
+	camera_diagonal_yaw_direction = 0.0
+	camera_diagonal_yaw_inactive_reason = ""
+
+	if not swing_tuning.camera_diagonal_yaw_enabled:
+		camera_diagonal_yaw_inactive_reason = "disabled"
+	elif get_tree().paused:
+		camera_diagonal_yaw_inactive_reason = "paused"
+	elif resetting_player:
+		camera_diagonal_yaw_inactive_reason = "resetting"
+	elif get_viewport().gui_get_focus_owner() != null:
+		camera_diagonal_yaw_inactive_reason = "ui_owns_input"
+	elif not camera_diagonal_yaw_traversal_allowed:
+		camera_diagonal_yaw_inactive_reason = "traversal_state"
+	elif (
+		movement_action_strength_snapshot.x
+		< swing_tuning.camera_diagonal_yaw_min_forward_input
+	):
+		camera_diagonal_yaw_inactive_reason = "forward_input_below_threshold"
+	elif (
+		maxf(
+			movement_action_strength_snapshot.z,
+			movement_action_strength_snapshot.w
+		)
+		< swing_tuning.camera_diagonal_yaw_min_lateral_input
+	):
+		camera_diagonal_yaw_inactive_reason = "lateral_input_below_threshold"
+	else:
+		camera_diagonal_yaw_direction = (
+			CameraDiagonalSteeringScript.requested_yaw_direction(
+				movement_action_strength_snapshot,
+				swing_tuning.camera_diagonal_yaw_min_forward_input,
+				swing_tuning.camera_diagonal_yaw_min_lateral_input
+			)
+		)
+		if is_zero_approx(camera_diagonal_yaw_direction):
+			camera_diagonal_yaw_inactive_reason = "ambiguous_or_opposing_input"
+
+	if not camera_diagonal_yaw_inactive_reason.is_empty():
+		camera_diagonal_yaw_direction = 0.0
+	var state_allowed: bool = (
+		camera_diagonal_yaw_traversal_allowed
+		and not get_tree().paused
+		and not resetting_player
+		and get_viewport().gui_get_focus_owner() == null
+	)
+	camera_diagonal_yaw_target_velocity = (
+		CameraDiagonalSteeringScript.target_yaw_velocity(
+			camera_diagonal_yaw_direction,
+			swing_tuning.camera_diagonal_yaw_enabled,
+			state_allowed,
+			swing_tuning.camera_diagonal_yaw_speed_degrees,
+			swing_tuning.camera_diagonal_yaw_max_velocity_degrees
+		)
+	)
+	if swing_tuning.camera_diagonal_yaw_enabled and state_allowed:
+		camera_diagonal_yaw_velocity = (
+			CameraDiagonalSteeringScript.approach_yaw_velocity(
+				camera_diagonal_yaw_velocity,
+				camera_diagonal_yaw_target_velocity,
+				swing_tuning.camera_diagonal_yaw_acceleration_degrees,
+				swing_tuning.camera_diagonal_yaw_deceleration_degrees,
+				swing_tuning.camera_diagonal_yaw_max_velocity_degrees,
+				delta
+			)
+		)
+	else:
+		camera_diagonal_yaw_velocity = 0.0
+	camera_orbit_offset += camera_diagonal_yaw_velocity * delta
+
+func get_current_visual_forward() -> Vector3:
+	if (
+		mixamo_hero_presentation != null
+		and mixamo_hero_presentation.character_root != null
+	):
+		var forward: Vector3 = (
+			mixamo_hero_presentation.character_root.global_basis
+			* Vector3.BACK
+		)
+		forward.y = 0.0
+		if forward.length_squared() > 0.0001:
+			return forward.normalized()
+	return PresentationFacingScript.forward_for_yaw(hero_root.rotation.y)
 
 func resolve_camera_position(look_target: Vector3, desired_position: Vector3) -> Vector3:
 	var ray: Vector3 = desired_position - look_target
@@ -1897,7 +2167,15 @@ func create_crosshair():
 	add_child(canvas)
 
 func reset_player():
+	resetting_player = true
 	wall_crawl_controller.reset()
 	release_web()
 	player.global_position = Vector3(0.0, 5.0, 0.0)
 	player.velocity = Vector3.ZERO
+	character_heading_yaw = 0.0
+	hero_root.rotation.y = 0.0
+	camera_diagonal_yaw_velocity = 0.0
+	camera_diagonal_yaw_target_velocity = 0.0
+	camera_diagonal_yaw_direction = 0.0
+	if mixamo_hero_presentation != null:
+		mixamo_hero_presentation.reset_presentation()
